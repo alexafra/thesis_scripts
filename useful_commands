@@ -1,0 +1,110 @@
+cd /home/alex/Development/Datasets/lerobot2/pick_toothepaste_3107_test_conversion
+
+# Replace every symlink with a real copy of what it points to
+for d in episode_*; do
+    if [ -L "$d" ]; then
+        echo "Converting symlink: $d"
+        real_target=$(readlink -f "$d")
+        rm "$d"
+        cp -a "$real_target" "$d"
+    fi
+done
+
+
+cd "$HOME/Development/Isaac-GR00T"
+
+RUN_DIR="$HOME/Development/Models/gr00t_batch_2_acc_8_0803_0217"
+
+uv run --no-sync python scripts/analysis_tools/plot_training_history.py \
+    --run-dir "$RUN_DIR" \
+    --smooth-window 20
+
+
+python sort_and_rename_folders.py \
+        --data_dir $HOME/datasets/testing  
+
+python sort_and_rename_folders.py --data_dir $HOME/development/datasets/testing
+
+watch -n 1 nvidia-smi
+
+# --raw-dir     Corresponds to the directory of your JSON dataset
+# --repo-id     Your unique repo ID on Hugging Face Hub
+# --push_to_hub Whether or not to upload the dataset to Hugging Face Hub (true or false)
+# --robot_type  The type of the robot used in the dataset (e.g., Unitree_Z1_Single, Unitree_Z1_Dual, Unitree_G1_Dex1, Unitree_G1_Dex3, Unitree_G1_Brainco, Unitree_G1_Inspire,Unitree_G1_Dex1_Sim)
+
+python convert_unitree_json_to_lerobot.py \
+    --raw-dir "$HOME/Development/Datasets/conversion" \
+    --repo-id testing_lerobot \
+    --robot_type Unitree_G1_Dex3_HeadOnly
+
+
+python convert_v3_to_v2.py \
+    --repo-id testing_lerobot \
+    --root "$HOME/Development/Datasets"
+
+
+
+python examples/SimplerEnv/convert_av1_to_h264.py \
+    "$HOME/Development/Datasets/testing_lerobot" \
+    --jobs 3
+
+
+#fine tune tun
+cd "$HOME/Development/Isaac-GR00T"
+
+TRAIN_DATASET="$HOME/Development/Datasets/lerobot2/pick_toothepaste_3107_train_lerobot"
+TRAIN_DIR="$HOME/Development/Models/groot_g1_toothpaste_40ep_$(date +%Y%m%d_%H%M%S)"
+
+echo "$TRAIN_DATASET"
+echo "$TRAIN_DIR"
+
+/home/alex/Development/Datasets/lerobot2/Toothpaste_green_plate_2807_hand_close
+DRYRUN_DIR="$HOME/Development/Models/groot_g1_dryrun_$(date +%Y%m%d_%H%M%S)"
+
+
+uv run --no-sync python gr00t/data/stats.py \
+    --dataset-path "$TRAIN_DATASET" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path examples/UnitreeG1/g1_dex3_headonly_config.py
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+NO_ALBUMENTATIONS_UPDATE=1 \
+uv run --no-sync python gr00t/experiment/launch_finetune.py \
+    --base-model-path "$HOME/Development/Models/GR00T-N1.7-3B" \
+    --dataset-path "$TRAIN_DATASET" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path examples/UnitreeG1/g1_dex3_headonly_config.py \
+    --num-gpus 1 \
+    --output-dir "$TRAIN_DIR" \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 4 \
+    --dataloader-num-workers 1 \
+    --episode-sampling-rate 1.0 \
+    --optim adafactor \
+    --learning-rate 1e-4 \
+    --max-steps 5000 \
+    --save-steps 1000 \
+    --save-total-limit 5
+
+
+
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python gr00t/experiment/launch_finetune.py \
+    --base-model-path "$HOME/Development/Models/GR00T-N1.7-3B" \
+    --dataset-path "$HOME/Development/Datasets/testing_lerobot" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path examples/UnitreeG1/g1_dex3_headonly_config.py \
+    --num-gpus 1 \
+    --output-dir "$DRYRUN_DIR" \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 1 \
+    --dataloader-num-workers 1 \
+    --episode-sampling-rate 1.0 \
+    --max-steps 2 \
+    --save-steps 1000 \
+    --save-total-limit 1 \
+    --save-only-model
+
+
+
+    /home/alex/Development/Datasets/lerobot2/Toothpaste_green_plate_2807_hand_close

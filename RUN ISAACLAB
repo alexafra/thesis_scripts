@@ -1,0 +1,62 @@
+MAX_HAND_TRACKING_ERROR_RAD=1.000
+CHANGEDSAFETY
+
+Isaaclab Run
+
+
+
+cd "$HOME/Development/unitree_sim_isaaclab"
+conda activate unitree_sim_env
+
+python sim_main.py \
+    --device cpu \
+    --enable_cameras \
+    --task Isaac-PickPlace-Cylinder-G129-Dex3-Joint \
+    --enable_dex3_dds \
+    --robot_type g129
+
+
+
+cd "$HOME/Development/Isaac-GR00T"
+
+CUDA_VISIBLE_DEVICES=0 \
+uv run --no-sync python -m gr00t.eval.run_gr00t_server \
+    --model-path "$HOME/Development/Models/c_only_batch_32_acc_1_chunk_32_20k_1008_1/checkpoint-20000" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --deployment-dataset-path "$HOME/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train" \
+    --device cuda:0 \
+    --host 127.0.0.1 \
+    --port 5555
+
+
+
+
+
+
+
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --sim \
+    --actuate \
+    --task pick-toothpaste \
+    --policy-host 127.0.0.1 \
+    --policy-port 5555 \
+    --image-host 127.0.0.1 \
+    --confirm-sim-network-isolated \
+    --initialization xr-home \
+    --inference-mode synchronous \
+    --execution-horizon 8 \
+    --max-chunks 100
+
+python -m unitree_lerobot.eval_robot.eval_groot_g1 \
+    --sim \
+    --actuate \
+    --task pick-toothpaste \
+    --policy-host 127.0.0.1 \
+    --policy-port 5555 \
+    --image-host 127.0.0.1 \
+    --confirm-sim-network-isolated \
+    --initialization xr-home \
+    --inference-mode rtc \
+    --execution-horizon 16 \
+    --max-chunks 100
+
