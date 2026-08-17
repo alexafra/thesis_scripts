@@ -10,13 +10,14 @@ The same command also accepts roots containing any subset of train/, test/, and
 validation/ (or validate/). Matching splits are merged independently.
 
 The destination is replaced transactionally. Sources are always copied and are
-never modified. Existing destination Parquet, video, and raw-depth files are not
-rewritten.
+never modified. Existing destination Parquet, video, raw-depth, and aligned-depth
+files are not rewritten.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -36,6 +37,7 @@ META_FILES = ("info.json", "tasks.jsonl", "episodes.jsonl", "episodes_stats.json
 SPLIT_NAMES = ("train", "test", "validation")
 VALIDATION_ALIASES = ("validation", "validate")
 SPECIAL_STATS = ("episode_index", "index", "task_index")
+SURFACE_NORMALS_LZ4_KEY = "surface_normals_lz4"
 
 
 class MergeError(RuntimeError):
@@ -184,6 +186,162 @@ def raw_depth_encoding(info: dict[str, Any]) -> dict[str, Any] | None:
     return encoding
 
 
+def aligned_depth_encoding(info: dict[str, Any]) -> dict[str, Any] | None:
+    encoding = info.get("aligned_depth_encoding")
+    if encoding is None:
+        return None
+    if not isinstance(encoding, dict):
+        raise MergeError("info.json aligned_depth_encoding must be an object")
+    return encoding
+
+
+def surface_normals_lz4(info: dict[str, Any]) -> dict[str, Any] | None:
+    config = info.get(SURFACE_NORMALS_LZ4_KEY)
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise MergeError(f"info.json {SURFACE_NORMALS_LZ4_KEY} must be an object")
+    required = {
+        "feature_key": "observation.images.surface_normals_view",
+        "storage": "plain_lz4_chunks",
+        "dtype": "uint8",
+        "layout": "FHWC",
+        "lossless_round_trip_verified": True,
+    }
+    for key, expected in required.items():
+        if config.get(key) != expected:
+            raise MergeError(
+                f"Unsupported {SURFACE_NORMALS_LZ4_KEY} {key}: {config.get(key)!r}"
+            )
+    try:
+        chunk_frames = int(config["chunk_frames"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MergeError(f"{SURFACE_NORMALS_LZ4_KEY} chunk_frames must be positive") from exc
+    if chunk_frames <= 0:
+        raise MergeError(f"{SURFACE_NORMALS_LZ4_KEY} chunk_frames must be positive")
+    feature = info.get("features", {}).get(config["feature_key"])
+    if not isinstance(feature, dict) or feature.get("dtype") != "video":
+        raise MergeError(
+            f"{SURFACE_NORMALS_LZ4_KEY} feature_key is not a video feature"
+        )
+    return config
+
+
+def _internal_dataset_path(root: Path, value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise MergeError(f"{label} must be a non-empty relative path")
+    relative = Path(value)
+    if relative.is_absolute():
+        raise MergeError(f"{label} must stay inside the dataset: {value}")
+    resolved_root = root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise MergeError(f"{label} escapes dataset root: {value}") from exc
+    return resolved
+
+
+def lz4_storage_root(root: Path, info: dict[str, Any]) -> Path:
+    config = surface_normals_lz4(info)
+    if config is None:
+        raise MergeError(f"{root} has no {SURFACE_NORMALS_LZ4_KEY} metadata")
+    return _internal_dataset_path(root, config.get("root"), f"{SURFACE_NORMALS_LZ4_KEY}.root")
+
+
+def lz4_backup_root(root: Path, info: dict[str, Any]) -> Path:
+    config = surface_normals_lz4(info)
+    if config is None:
+        raise MergeError(f"{root} has no {SURFACE_NORMALS_LZ4_KEY} metadata")
+    return _internal_dataset_path(
+        root,
+        config.get("h264_backup"),
+        f"{SURFACE_NORMALS_LZ4_KEY}.h264_backup",
+    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_lz4_episode(
+    root: Path,
+    info: dict[str, Any],
+    episode_index: int,
+    expected_frames: int,
+    *,
+    verify_hashes: bool = False,
+) -> int:
+    config = surface_normals_lz4(info)
+    assert config is not None
+    episode_dir = lz4_storage_root(root, info) / f"episode_{episode_index:06d}"
+    index_path = episode_dir / "index.json"
+    index = read_json(index_path)
+    if int(index.get("episode_index", -1)) != episode_index:
+        raise MergeError(f"LZ4 index episode mismatch in {episode_dir}")
+    if (
+        index.get("dtype") != "uint8"
+        or index.get("layout") != "FHWC"
+        or index.get("transform") != "none"
+        or int(index.get("chunk_frames", -1)) != int(config["chunk_frames"])
+        or not index.get("chunks_are_independent")
+        or not index.get("lossless_round_trip_verified")
+    ):
+        raise MergeError(f"Invalid plain-LZ4 index contract in {episode_dir}")
+    shape = info["features"][config["feature_key"]]["shape"]
+    if len(shape) != 3:
+        raise MergeError(f"Invalid surface-normal feature shape in {root}")
+    height, width, channels = (int(value) for value in shape)
+    next_frame = 0
+    compressed_bytes = 0
+    chunks = index.get("chunks")
+    if not isinstance(chunks, list):
+        raise MergeError(f"Invalid LZ4 chunk list in {episode_dir}")
+    for expected_chunk_index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            raise MergeError(f"Invalid LZ4 chunk record in {episode_dir}")
+        frame_count = int(chunk.get("frame_count", -1))
+        if (
+            int(chunk.get("chunk_index", -1)) != expected_chunk_index
+            or int(chunk.get("start_frame", -1)) != next_frame
+            or frame_count <= 0
+            or frame_count > int(config["chunk_frames"])
+            or [int(chunk.get(key, -1)) for key in ("height", "width", "channels")]
+            != [height, width, channels]
+            or int(chunk.get("uncompressed_bytes", -1))
+            != frame_count * height * width * channels
+        ):
+            raise MergeError(f"Invalid LZ4 chunk layout in {episode_dir}")
+        filename = chunk.get("filename")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise MergeError(f"Invalid LZ4 chunk filename in {episode_dir}")
+        chunk_path = episode_dir / filename
+        if not chunk_path.is_file():
+            raise MergeError(f"Missing LZ4 chunk: {chunk_path}")
+        size = chunk_path.stat().st_size
+        if size != int(chunk.get("compressed_bytes", -1)):
+            raise MergeError(f"LZ4 chunk size mismatch: {chunk_path}")
+        expected_hash = chunk.get("compressed_sha256")
+        if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+            raise MergeError(f"Invalid LZ4 chunk checksum in {episode_dir}")
+        if verify_hashes and sha256_file(chunk_path) != expected_hash:
+            raise MergeError(f"LZ4 chunk checksum mismatch: {chunk_path}")
+        if not chunk.get("lossless_round_trip_verified"):
+            raise MergeError(f"Unverified LZ4 chunk in {episode_dir}")
+        next_frame += frame_count
+        compressed_bytes += size
+    if next_frame != expected_frames or int(index.get("frame_count", -1)) != expected_frames:
+        raise MergeError(f"LZ4 frame count mismatch in {episode_dir}")
+    backup = lz4_backup_root(root, info) / f"episode_{episode_index:06d}.mp4"
+    if not backup.is_file():
+        raise MergeError(f"Missing surface-normal H.264 backup: {backup}")
+    return compressed_bytes
+
+
 def raw_depth_path(
     root: Path,
     info: dict[str, Any],
@@ -213,6 +371,38 @@ def raw_depth_path(
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
         raise MergeError(f"Raw-depth path escapes dataset root: {relative}") from exc
+    return resolved_path
+
+
+def aligned_depth_path(
+    root: Path,
+    info: dict[str, Any],
+    episode_index: int,
+    frame_index: int,
+) -> Path:
+    encoding = aligned_depth_encoding(info)
+    if encoding is None:
+        raise MergeError(f"{root} has no aligned_depth_encoding metadata")
+
+    template = encoding.get("path")
+    if not isinstance(template, str) or not template:
+        raise MergeError(f"{root}/meta/info.json has no aligned-depth path template")
+
+    try:
+        relative = template.format(
+            episode_chunk=episode_index // int(info["chunks_size"]),
+            episode_index=episode_index,
+            frame_index=frame_index,
+        )
+    except (KeyError, ValueError) as exc:
+        raise MergeError(f"Invalid aligned-depth path template in {root}: {template}") from exc
+
+    resolved_root = root.resolve()
+    resolved_path = (root / relative).resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise MergeError(f"Aligned-depth path escapes dataset root: {relative}") from exc
     return resolved_path
 
 
@@ -264,8 +454,30 @@ def validate_dataset(root: Path, *, inspect_rows: bool = True) -> dict[str, Any]
         if int(raw_encoding.get("total_files", -1)) != total_frames:
             raise MergeError(f"Raw-depth file count in {root} does not match info.json total_frames")
 
+    aligned_encoding = aligned_depth_encoding(info)
+    if aligned_encoding is not None:
+        if aligned_encoding.get("storage") != "lossless_png":
+            raise MergeError(
+                f"Unsupported aligned-depth storage in {root}: {aligned_encoding.get('storage')}"
+            )
+        if int(aligned_encoding.get("total_files", -1)) != total_frames:
+            raise MergeError(
+                f"Aligned-depth file count in {root} does not match info.json total_frames"
+            )
+
+    lz4_config = surface_normals_lz4(info)
+    lz4_feature_key = lz4_config.get("feature_key") if lz4_config is not None else None
+    if lz4_config is not None:
+        storage_root = lz4_storage_root(root, info)
+        backup_root = lz4_backup_root(root, info)
+        if not storage_root.is_dir():
+            raise MergeError(f"Missing surface-normal LZ4 root: {storage_root}")
+        if not backup_root.is_dir():
+            raise MergeError(f"Missing surface-normal H.264 backup root: {backup_root}")
+
     expected_index = 0
     raw_files = 0
+    aligned_files = 0
     required_columns = {"frame_index", "episode_index", "index", "task_index"}
     task_indices = set(range(len(tasks)))
     for episode in episodes:
@@ -275,6 +487,9 @@ def validate_dataset(root: Path, *, inspect_rows: bool = True) -> dict[str, Any]
         if not parquet_path.is_file():
             raise MergeError(f"Missing episode data: {parquet_path}")
         for key in video_keys(info):
+            if key == lz4_feature_key:
+                validate_lz4_episode(root, info, episode_index, length)
+                continue
             path = video_path(root, info, episode_index, key)
             if not path.is_file():
                 raise MergeError(f"Missing episode video: {path}")
@@ -284,6 +499,12 @@ def validate_dataset(root: Path, *, inspect_rows: bool = True) -> dict[str, Any]
                 if not path.is_file():
                     raise MergeError(f"Missing raw-depth frame: {path}")
                 raw_files += 1
+        if aligned_encoding is not None:
+            for frame_index in range(length):
+                path = aligned_depth_path(root, info, episode_index, frame_index)
+                if not path.is_file():
+                    raise MergeError(f"Missing aligned-depth frame: {path}")
+                aligned_files += 1
         if not inspect_rows:
             continue
         table = pq.read_table(parquet_path, columns=list(required_columns))
@@ -306,6 +527,10 @@ def validate_dataset(root: Path, *, inspect_rows: bool = True) -> dict[str, Any]
         expected_index += length
     if raw_encoding is not None and raw_files != total_frames:
         raise MergeError(f"Found {raw_files} raw-depth files in {root}; expected {total_frames}")
+    if aligned_encoding is not None and aligned_files != total_frames:
+        raise MergeError(
+            f"Found {aligned_files} aligned-depth files in {root}; expected {total_frames}"
+        )
     return info
 
 
@@ -331,6 +556,24 @@ def check_compatible(destination: Path, source: Path, destination_info: dict[str
     )
     if destination_raw_signature != source_raw_signature:
         differences.append("raw_depth_encoding")
+    destination_aligned = aligned_depth_encoding(destination_info)
+    source_aligned = aligned_depth_encoding(source_info)
+    destination_aligned_signature = (
+        {key: value for key, value in destination_aligned.items() if key != "total_files"}
+        if destination_aligned is not None
+        else None
+    )
+    source_aligned_signature = (
+        {key: value for key, value in source_aligned.items() if key != "total_files"}
+        if source_aligned is not None
+        else None
+    )
+    if destination_aligned_signature != source_aligned_signature:
+        differences.append("aligned_depth_encoding")
+    destination_lz4 = surface_normals_lz4(destination_info)
+    source_lz4 = surface_normals_lz4(source_info)
+    if destination_lz4 != source_lz4:
+        differences.append(SURFACE_NORMALS_LZ4_KEY)
     if differences:
         raise MergeError(f"{source} is incompatible with {destination}: different {', '.join(differences)}")
     if compatibility_value(destination, "modality.json") != compatibility_value(source, "modality.json"):
@@ -400,6 +643,81 @@ def replace_column(table: pa.Table, name: str, values: np.ndarray) -> pa.Table:
     return table.set_column(column_index, field, array)
 
 
+def copy_reindexed_lz4_episode(
+    destination: Path,
+    source: Path,
+    destination_info: dict[str, Any],
+    source_info: dict[str, Any],
+    old_episode_index: int,
+    new_episode_index: int,
+    length: int,
+) -> None:
+    validate_lz4_episode(
+        source,
+        source_info,
+        old_episode_index,
+        length,
+        verify_hashes=True,
+    )
+    source_episode = lz4_storage_root(source, source_info) / f"episode_{old_episode_index:06d}"
+    destination_episode = (
+        lz4_storage_root(destination, destination_info) / f"episode_{new_episode_index:06d}"
+    )
+    if destination_episode.exists():
+        raise MergeError(f"Destination LZ4 episode already exists: {destination_episode}")
+    destination_episode.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_episode, destination_episode, copy_function=shutil.copy2)
+    index_path = destination_episode / "index.json"
+    index = read_json(index_path)
+    index["episode_index"] = new_episode_index
+    atomic_write_json(index_path, index)
+
+    source_backup = lz4_backup_root(source, source_info) / f"episode_{old_episode_index:06d}.mp4"
+    destination_backup = (
+        lz4_backup_root(destination, destination_info) / f"episode_{new_episode_index:06d}.mp4"
+    )
+    destination_backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_backup, destination_backup)
+    validate_lz4_episode(destination, destination_info, new_episode_index, length)
+
+
+def refresh_lz4_metadata(root: Path, info: dict[str, Any]) -> None:
+    config = surface_normals_lz4(info)
+    if config is None:
+        return
+    episodes = read_jsonl(root / "meta" / "episodes.jsonl")
+    compressed_bytes = sum(
+        validate_lz4_episode(
+            root,
+            info,
+            int(episode["episode_index"]),
+            int(episode["length"]),
+        )
+        for episode in episodes
+    )
+    manifest_path = lz4_storage_root(root, info) / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest.update(
+        {
+            "feature_key": config["feature_key"],
+            "dtype": "uint8",
+            "layout": "FHWC",
+            "transform": "none",
+            "chunk_frames": int(config["chunk_frames"]),
+            "episode_count": int(info["total_episodes"]),
+            "frame_count": int(info["total_frames"]),
+            "compressed_bytes": compressed_bytes,
+            "all_lossless_round_trips_verified": True,
+            "canonical_commit_pending": False,
+        }
+    )
+    atomic_write_json(manifest_path, manifest)
+
+    h264_info = json.loads(json.dumps(info))
+    h264_info.pop(SURFACE_NORMALS_LZ4_KEY, None)
+    atomic_write_json(root / "meta" / "info.json.h264_backup", h264_info)
+
+
 def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
     destination_info, destination_tasks, destination_episodes, destination_stats = load_metadata(destination)
     source_info, source_tasks, source_episodes, source_stats = load_metadata(source)
@@ -446,7 +764,22 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
         destination_parquet = episode_path(destination, destination_info, new_episode_index)
         destination_parquet.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, destination_parquet, compression="snappy")
+        destination_lz4 = surface_normals_lz4(destination_info)
+        lz4_feature_key = (
+            destination_lz4.get("feature_key") if destination_lz4 is not None else None
+        )
         for key in video_keys(destination_info):
+            if key == lz4_feature_key:
+                copy_reindexed_lz4_episode(
+                    destination,
+                    source,
+                    destination_info,
+                    source_info,
+                    old_episode_index,
+                    new_episode_index,
+                    length,
+                )
+                continue
             source_video = video_path(source, source_info, old_episode_index, key)
             destination_video = video_path(destination, destination_info, new_episode_index, key)
             destination_video.parent.mkdir(parents=True, exist_ok=True)
@@ -467,6 +800,22 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                 )
                 destination_raw_depth.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_raw_depth, destination_raw_depth)
+        if aligned_depth_encoding(destination_info) is not None:
+            for frame_index in range(length):
+                source_aligned_depth = aligned_depth_path(
+                    source,
+                    source_info,
+                    old_episode_index,
+                    frame_index,
+                )
+                destination_aligned_depth = aligned_depth_path(
+                    destination,
+                    destination_info,
+                    new_episode_index,
+                    frame_index,
+                )
+                destination_aligned_depth.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_aligned_depth, destination_aligned_depth)
 
         new_episode = dict(source_episode)
         new_episode["episode_index"] = new_episode_index
@@ -494,6 +843,9 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
     destination_raw = raw_depth_encoding(destination_info)
     if destination_raw is not None:
         destination_raw["total_files"] = next_global_index
+    destination_aligned = aligned_depth_encoding(destination_info)
+    if destination_aligned is not None:
+        destination_aligned["total_files"] = next_global_index
 
     meta = destination / "meta"
     atomic_write_jsonl(meta / "tasks.jsonl", destination_tasks)
@@ -501,6 +853,7 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
     atomic_write_jsonl(meta / "episodes_stats.jsonl", destination_stats)
     atomic_write_json(meta / "stats.json", aggregate_all_stats(destination_stats))
     atomic_write_json(meta / "info.json", destination_info)
+    refresh_lz4_metadata(destination, destination_info)
     relative_stats = meta / "relative_stats.json"
     if relative_stats.exists():
         relative_stats.unlink()

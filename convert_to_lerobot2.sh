@@ -24,11 +24,13 @@ The input must be either:
 A direct episode root is replaced with LeRobot v2.1. For a split parent, each
 present split is converted independently in place and remains separate.
 
-The aligned depth view is converted to model-ready H.264 as before. Set
-INCLUDE_SURFACE_NORMALS=1 to additionally derive a camera-frame XYZ surface-
-normal view directly from each aligned uint16 depth_0 PNG. Every raw_depth_0
-PNG is preserved as before; surface-normal conversions also preserve depth_0
-losslessly for reproducibility.
+The aligned depth view is converted to byte-exact libx264rgb/gbrp H.264 so its
+decoded bytes match the live model input. Set INCLUDE_SURFACE_NORMALS=1 to
+additionally derive a camera-frame XYZ surface-normal view directly from each
+aligned uint16 depth_0 PNG. Surface normals are stored as lossless, independent
+32-frame LZ4 chunks, with their byte-exact H.264 files retained beside them as
+an _h264_backup. Every raw_depth_0 PNG is preserved as before; surface-normal
+conversions also preserve depth_0 losslessly for reproducibility.
 
 Arguments:
   PATH/TO/INPUT_COPY  Disposable direct-episode or split-parent dataset copy.
@@ -98,6 +100,7 @@ V3_TO_V2_PROJECT="$ISAAC_GROOT_REPO/scripts/lerobot_conversion"
 V3_TO_V2_SCRIPT="$V3_TO_V2_PROJECT/convert_v3_to_v2.py"
 H264_SCRIPT="$ISAAC_GROOT_REPO/examples/SimplerEnv/convert_av1_to_h264.py"
 MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality.json"
+LZ4_SCRIPT="$(dirname "$(realpath "$0")")/convert_canonical_surface_normals_to_lz4.py"
 
 [[ -x "$UNITREE_PYTHON" ]] || \
     die "Unitree environment Python is missing: $UNITREE_PYTHON"
@@ -116,6 +119,11 @@ MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality.json"
 
 [[ -f "$MODALITY_FILE" ]] || \
     die "Unitree modality file is missing: $MODALITY_FILE"
+
+if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
+    [[ -f "$LZ4_SCRIPT" ]] || \
+        die "Surface-normal LZ4 converter is missing: $LZ4_SCRIPT"
+fi
 
 mapfile -d '' DIRECT_EPISODE_DIRS < <(
     find "$LEROBOT_DIR" \
@@ -274,8 +282,9 @@ printf 'Episodes:    %d\n' "${#EPISODE_DIRS[@]}"
 printf 'Repository:  %s\n' "$REPO_ID"
 if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf 'Geometry:    linear depth + camera-frame XYZ surface normals\n'
+    printf 'Normals:     lossless 32-frame LZ4 chunks + H.264 backup\n'
 fi
-printf 'Final form:  LeRobot v2.1 with H.264 video and lossless depth sidecars\n\n'
+printf 'Final form:  LeRobot v2.1 with byte-exact H.264 geometry and lossless depth sidecars\n\n'
 
 printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
 
@@ -323,6 +332,46 @@ printf '[3/6] Transcoding dataset video from AV1 to H.264...\n'
         "$V2_DATASET" \
         --jobs "$JOBS"
 )
+
+# The v3 metadata describes the pre-transcode AV1 streams. Refresh every video
+# feature from the installed H.264 file so downstream readers see the actual
+# codec and pixel format (including byte-exact geometry GBR).
+"$UNITREE_PYTHON" - "$V2_DATASET" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+from lerobot.datasets.video_utils import get_video_info
+
+dataset = Path(sys.argv[1])
+info_path = dataset / "meta" / "info.json"
+with info_path.open(encoding="utf-8") as file:
+    info = json.load(file)
+
+for feature_key, feature in info.get("features", {}).items():
+    if feature.get("dtype") != "video":
+        continue
+    videos = sorted((dataset / "videos").glob(f"chunk-*/{feature_key}/episode_*.mp4"))
+    if not videos:
+        raise FileNotFoundError(f"No video found for metadata feature {feature_key}")
+    feature["info"] = get_video_info(videos[0])
+
+temporary = info_path.with_name(f".{info_path.name}.tmp")
+with temporary.open("w", encoding="utf-8") as file:
+    json.dump(info, file, indent=4)
+    file.write("\n")
+    file.flush()
+    os.fsync(file.fileno())
+os.replace(temporary, info_path)
+PY
+
+if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
+    printf '[3b/6] Converting surface normals to verified 32-frame LZ4 chunks...\n'
+    "$UNITREE_PYTHON" -u "$LZ4_SCRIPT" \
+        --split-root "$V2_DATASET" \
+        --chunk-frames 32
+fi
 
 printf '[4/6] Preserving uint16 depth PNGs losslessly...\n'
 
@@ -548,10 +597,11 @@ if include_surface_normals:
 
 raw_depth_template = raw_depth_encoding["path"]
 chunks_size = int(info["chunks_size"])
-for episode_index, episode in enumerate(
+episodes = list(
     json.loads(line)
     for line in (dataset / "meta" / "episodes.jsonl").read_text().splitlines()
-):
+)
+for episode_index, episode in enumerate(episodes):
     for frame_index in range(int(episode["length"])):
         raw_depth = dataset / raw_depth_template.format(
             episode_chunk=episode_index // chunks_size,
@@ -574,9 +624,44 @@ if include_surface_normals:
         "observation.images.surface_normals_view"
     )
 
+    lz4 = info["surface_normals_lz4"]
+    assert lz4["feature_key"] == "observation.images.surface_normals_view"
+    assert lz4["storage"] == "plain_lz4_chunks"
+    assert lz4["dtype"] == "uint8"
+    assert lz4["layout"] == "FHWC"
+    assert lz4["chunk_frames"] == 32
+    assert lz4["lossless_round_trip_verified"] is True
+    normal_root = dataset / lz4["root"]
+    normal_backup = dataset / lz4["h264_backup"]
+    assert normal_root.is_dir(), normal_root
+    assert normal_backup.is_dir(), normal_backup
+    backup_videos = list(normal_backup.glob("episode_*.mp4"))
+    assert len(backup_videos) == expected_episodes, len(backup_videos)
+    for episode in episodes:
+        episode_index = int(episode["episode_index"])
+        index_path = normal_root / f"episode_{episode_index:06d}" / "index.json"
+        with index_path.open(encoding="utf-8") as file:
+            index = json.load(file)
+        assert index["episode_index"] == episode_index
+        assert index["dtype"] == "uint8"
+        assert index["layout"] == "FHWC"
+        assert index["transform"] == "none"
+        assert index["chunks_are_independent"] is True
+        assert index["chunk_frames"] == 32
+        assert index["frame_count"] == int(episode["length"])
+        chunks = index["chunks"]
+        assert chunks
+        assert sum(int(chunk["frame_count"]) for chunk in chunks) == int(
+            episode["length"]
+        )
+        for chunk_index, chunk in enumerate(chunks):
+            frame_count = int(chunk["frame_count"])
+            assert frame_count == 32 or (
+                chunk_index == len(chunks) - 1 and 1 <= frame_count <= 32
+            )
+            assert (index_path.parent / chunk["filename"]).is_file()
+
 feature_keys = ["observation.images.ego_view", "observation.images.depth_gray_view"]
-if include_surface_normals:
-    feature_keys.append("observation.images.surface_normals_view")
 for feature_key in feature_keys:
     videos = list((dataset / "videos").glob(f"chunk-*/{feature_key}/episode_*.mp4"))
     assert len(videos) == expected_episodes, (feature_key, len(videos), expected_episodes)
@@ -611,8 +696,8 @@ for video in "${VIDEOS[@]}"; do
     [[ "$codec" == "h264" ]] || \
         die "Expected H.264 but found '$codec': $video"
 
-    if [[ "$INCLUDE_SURFACE_NORMALS" == 1 &&
-          "$video" == *"/observation.images.surface_normals_view/"* ]]; then
+    if [[ "$video" == *"/observation.images.depth_gray_view/"* ||
+          "$video" == *"/observation.images.surface_normals_view_h264_backup/"* ]]; then
         pixel_format="$(
             ffprobe \
                 -v error \
@@ -622,8 +707,8 @@ for video in "${VIDEOS[@]}"; do
                 "$video"
         )"
 
-        [[ "$pixel_format" == "yuv444p" ]] || \
-            die "Expected yuv444p surface-normal video but found '$pixel_format': $video"
+        [[ "$pixel_format" == "gbrp" ]] || \
+            die "Expected byte-exact libx264rgb/gbrp geometry video but found '$pixel_format': $video"
     fi
 done
 

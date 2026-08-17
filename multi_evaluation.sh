@@ -7,6 +7,7 @@ TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_An
 VALIDATION_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/validation"
 BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 
 MODALITY_CONFIGS=(
     # "examples/UnitreeG1/g1_dex3_head_3_channel_gray_depth_config.py"
@@ -44,7 +45,8 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
         --train-dataset-path "$TRAIN_DATASET" \
         --output-dir "$MODEL_DIR/evaluation_exec_hor_${EXECUTION_HORIZON}" \
         --steps 0 \
-        --execution-horizon 8 \
+        --execution-horizon "$EXECUTION_HORIZON" \
+        --inference-batch-size "$INFERENCE_BATCH_SIZE" \
         --denoising-steps 4 \
         --inference-seed 42 \
         --modality-keys left_arm right_arm left_hand right_hand \

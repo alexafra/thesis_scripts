@@ -9,7 +9,7 @@ BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 DRY_RUN="${DRY_RUN:-0}"
-RUN_SUFFIX="${RUN_SUFFIX:-1808_1}"
+RUN_SUFFIX="${RUN_SUFFIX:-1708_1}"
 
 if [[ "$DRY_RUN" == "1" ]]; then
     MAX_STEPS=1
@@ -28,44 +28,33 @@ else
     exit 1
 fi
 
-EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$HOME/Development/multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
+EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$HOME/Development/partial_multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
 printf 'stage\tmodel\tstatus\texit_code\n' > "$EVALUATION_STATUS_FILE"
 TRAINING_FAILURES=()
 EVALUATION_FAILURES=()
 
 MODALITY_CONFIGS=(
-    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
-    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
     "examples/UnitreeG1/g1_dex3_head_3_channel_gray_depth_config.py"
-    "examples/UnitreeG1/g1_dex3_head_4_channel_gray_depth_fusion_config.py"
+    "examples/UnitreeG1/g1_dex3_head_3_channel_surface_normals_config.py"
 )
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_fp32_batch_8_acc_4_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_d1_separate_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/c_d1_separate_patch_frozen_fp32_batch_8_acc_4_chunk_32_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/c_normals_separate_patch_frozen_fp32_batch_8_acc_4_chunk_32_${RUN_LABEL}_${RUN_SUFFIX}"
 )
 
 PATCH_EMBED_FLAGS=(
-    "--tune-vision-patch-embed"
-    "--tune-vision-patch-embed"
     "--no-tune-vision-patch-embed"
-    "--tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
 )
 
-LOAD_BF16_FLAGS=(0 1 1 1)
-BATCH_SIZES=(8 32 32 32)
-ACCUMULATION_STEPS=(4 1 1 1)
-PATCH_INIT_MODES=("rgb_mean" "rgb_mean" "" "rgb_mean")
-INCLUDE_BASE_MODEL=(0 0 1 0)
+LOAD_BF16_FLAGS=(0 0)
+
+INCLUDE_BASE_MODEL=(1 1)
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_EMBED_FLAGS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#LOAD_BF16_FLAGS[@]} ||
-      ${#MODALITY_CONFIGS[@]} -ne ${#BATCH_SIZES[@]} ||
-      ${#MODALITY_CONFIGS[@]} -ne ${#ACCUMULATION_STEPS[@]} ||
-      ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_INIT_MODES[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#INCLUDE_BASE_MODEL[@]} ]]; then
     echo "Error: experiment arrays must have the same number of entries." >&2
     exit 1
@@ -111,13 +100,6 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
     MODEL_DIR="${MODEL_DIRS[$i]}"
     PATCH_EMBED_FLAG="${PATCH_EMBED_FLAGS[$i]}"
     LOAD_BF16="${LOAD_BF16_FLAGS[$i]}"
-    BATCH_SIZE="${BATCH_SIZES[$i]}"
-    ACCUMULATION_STEP="${ACCUMULATION_STEPS[$i]}"
-    PATCH_INIT_MODE="${PATCH_INIT_MODES[$i]}"
-    PATCH_INIT_ARGS=()
-    if [[ -n "$PATCH_INIT_MODE" ]]; then
-        PATCH_INIT_ARGS=(--vision-patch-embed-init "$PATCH_INIT_MODE")
-    fi
     BACKBONE_STORAGE_ARGS=()
     BACKBONE_STORAGE_LABEL="FP32"
     if [[ "$LOAD_BF16" == "1" ]]; then
@@ -135,13 +117,12 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
     echo "Modality config: $MODALITY_CONFIG_PATH"
     echo "Backbone storage: $BACKBONE_STORAGE_LABEL"
     echo "Patch embedding: $PATCH_EMBED_FLAG"
-    echo "Patch init:      ${PATCH_INIT_MODE:-default}"
-    echo "Batch:           $BATCH_SIZE x accumulation $ACCUMULATION_STEP"
+    echo "Batch:           8 x accumulation 4"
     echo "Output:          $MODEL_DIR"
     echo "============================================================"
 
     if CUDA_VISIBLE_DEVICES=0 \
-       PYTORCH_ALLOC_CONF=expandable_segments:True \
+       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
        NO_ALBUMENTATIONS_UPDATE=1 \
        uv run --no-sync python -m gr00t.experiment.launch_finetune \
            --base-model-path "$BASE_MODEL_PATH" \
@@ -151,13 +132,12 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
            --no-tune-llm \
            --no-tune-visual \
            "$PATCH_EMBED_FLAG" \
-           "${PATCH_INIT_ARGS[@]}" \
            --tune-projector \
            "${BACKBONE_STORAGE_ARGS[@]}" \
            --num-gpus 1 \
            --output-dir "$MODEL_DIR" \
-           --global-batch-size "$BATCH_SIZE" \
-           --gradient-accumulation-steps "$ACCUMULATION_STEP" \
+           --global-batch-size 8 \
+           --gradient-accumulation-steps 4 \
            --dataloader-num-workers 4 \
            --episode-sampling-rate 0.1 \
            --optim adafactor \
