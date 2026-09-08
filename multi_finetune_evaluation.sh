@@ -3,13 +3,16 @@ set -euo pipefail
 
 cd "$HOME/Development/Isaac-GR00T"
 
-TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train"
-VALIDATION_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/validation"
+DATASET_ROOT="${DATASET_ROOT:-/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08}"
+TRAIN_DATASET="${TRAIN_DATASET:-$DATASET_ROOT/train}"
+VALIDATION_DATASET="${VALIDATION_DATASET:-$DATASET_ROOT/validation}"
 BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 DRY_RUN="${DRY_RUN:-0}"
-RUN_SUFFIX="${RUN_SUFFIX:-1808_1}"
+RUN_SUFFIX="${RUN_SUFFIX:-three_cups_rightonly_1408_stack_0908_$(date +%Y-%m-%dT%H%M%S%z)}"
+LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
+mkdir -p "$LOG_ROOT"
 
 if [[ "$DRY_RUN" == "1" ]]; then
     MAX_STEPS=1
@@ -18,9 +21,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
     EVAL_STEPS=8
     EVAL_SELECTION_ARGS=(--traj-ids 0 --train-traj-ids 0 --trajectory-plot-episodes 0)
 elif [[ "$DRY_RUN" == "0" ]]; then
-    MAX_STEPS=20000
-    SAVE_STEPS=4000
-    RUN_LABEL="20k"
+    MAX_STEPS=30000
+    SAVE_STEPS=5000
+    RUN_LABEL="30k"
     EVAL_STEPS=0
     EVAL_SELECTION_ARGS=(--train-probe-episodes 3)
 else
@@ -28,37 +31,34 @@ else
     exit 1
 fi
 
-EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$HOME/Development/multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
+EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$LOG_ROOT/multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
 printf 'stage\tmodel\tstatus\texit_code\n' > "$EVALUATION_STATUS_FILE"
 TRAINING_FAILURES=()
 EVALUATION_FAILURES=()
 
 MODALITY_CONFIGS=(
-    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
-    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
-    "examples/UnitreeG1/g1_dex3_head_3_channel_gray_depth_config.py"
+    "examples/UnitreeG1/g1_dex3_headonly_config.py"
     "examples/UnitreeG1/g1_dex3_head_4_channel_gray_depth_fusion_config.py"
+    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
 )
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_fp32_batch_8_acc_4_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_d1_separate_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/c_rgb_patch_tuned_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$HOME/Development/Models/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
 )
 
 PATCH_EMBED_FLAGS=(
     "--tune-vision-patch-embed"
     "--tune-vision-patch-embed"
-    "--no-tune-vision-patch-embed"
     "--tune-vision-patch-embed"
 )
 
-LOAD_BF16_FLAGS=(0 1 1 1)
-BATCH_SIZES=(8 32 32 32)
-ACCUMULATION_STEPS=(4 1 1 1)
-PATCH_INIT_MODES=("rgb_mean" "rgb_mean" "" "rgb_mean")
-INCLUDE_BASE_MODEL=(0 0 1 0)
+LOAD_BF16_FLAGS=(1 1 1)
+BATCH_SIZES=(32 32 32)
+ACCUMULATION_STEPS=(1 1 1)
+PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean")
+INCLUDE_BASE_MODEL=(1 0 0)
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_EMBED_FLAGS[@]} ||
@@ -141,7 +141,7 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
     echo "============================================================"
 
     if CUDA_VISIBLE_DEVICES=0 \
-       PYTORCH_ALLOC_CONF=expandable_segments:True \
+       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
        NO_ALBUMENTATIONS_UPDATE=1 \
        uv run --no-sync python -m gr00t.experiment.launch_finetune \
            --base-model-path "$BASE_MODEL_PATH" \
