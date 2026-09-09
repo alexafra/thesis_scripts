@@ -34,9 +34,7 @@ def test_donor_assignment_is_deterministic_same_task_and_never_self():
         _record(4, "task b"),
     ]
     first = geometry.build_donor_assignments(records, shuffle_seed=42, shuffle_repeat=0)
-    second = geometry.build_donor_assignments(
-        records, shuffle_seed=42, shuffle_repeat=0
-    )
+    second = geometry.build_donor_assignments(records, shuffle_seed=42, shuffle_repeat=0)
 
     assert first == second
     by_position = {record.loader_position: record for record in records}
@@ -64,6 +62,13 @@ def test_phase_mapping_matches_endpoints_and_normalized_progress():
     assert geometry.phase_matched_frame(50, 101, 51) == 25
     assert geometry.phase_matched_frame(100, 101, 51) == 50
     assert geometry.phase_matched_frame(0, 1, 51) == 0
+
+
+def test_out_of_phase_mapping_is_shifted_by_half_an_episode():
+    assert geometry.donor_frame_for_phase(0, 101, 51, donor_phase="out_of_phase") == 25
+    assert geometry.donor_frame_for_phase(25, 101, 51, donor_phase="out_of_phase") == 38
+    assert geometry.donor_frame_for_phase(50, 101, 51, donor_phase="out_of_phase") == 0
+    assert geometry.donor_frame_for_phase(100, 101, 51, donor_phase="out_of_phase") == 25
 
 
 def test_training_split_cannot_be_mislabeled_as_evaluation():
@@ -104,14 +109,33 @@ def test_geometry_replacement_changes_only_requested_evaluation_view():
     assert shuffled["video.ego_view"] is flat["video.ego_view"]
     assert shuffled["state.left_arm"] is flat["state.left_arm"]
     assert (
-        shuffled["annotation.human.task_description"]
-        == flat["annotation.human.task_description"]
+        shuffled["annotation.human.task_description"] == flat["annotation.human.task_description"]
     )
     np.testing.assert_array_equal(shuffled["video.depth_gray_view"], donor[None])
     np.testing.assert_array_equal(flat["video.depth_gray_view"], depth)
 
 
-def test_paired_summary_reports_sensitivity_and_positive_shuffled_error_delta():
+def test_zero_geometry_preserves_shape_dtype_and_supports_depth_and_normals():
+    for geometry_key in ("depth_gray_view", "surface_normals_view"):
+        original = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+        zeroed = geometry.zero_geometry_frame(original)
+        flat = {
+            "video.ego_view": np.full((1, 2, 2, 3), 99, dtype=np.uint8),
+            f"video.{geometry_key}": original[None],
+        }
+        replaced = geometry.replace_geometry(flat, geometry_key, zeroed)
+
+        assert zeroed.shape == original.shape
+        assert zeroed.dtype == original.dtype
+        assert not np.any(zeroed)
+        assert np.any(original)
+        assert not np.any(replaced[f"video.{geometry_key}"])
+        assert replaced["video.ego_view"] is flat["video.ego_view"]
+
+    assert "zero_geometry" in geometry.INTERVENTIONS
+
+
+def test_paired_summary_reports_sensitivity_and_positive_counterfactual_error_delta():
     rows = []
     for episode, task, delta in (
         (1, "task a", 0.2),
@@ -122,6 +146,7 @@ def test_paired_summary_reports_sensitivity_and_positive_shuffled_error_delta():
             {
                 "checkpoint_step": 25000,
                 "split": "validation",
+                "intervention": "out_of_phase",
                 "shuffle_repeat": 0,
                 "episode_index": episode,
                 "task": task,
@@ -129,15 +154,15 @@ def test_paired_summary_reports_sensitivity_and_positive_shuffled_error_delta():
                 "group": "all",
                 "sample_count": 10,
                 "intact_sum_absolute_error": 1.0,
-                "shuffled_sum_absolute_error": 1.0 + 10 * delta,
+                "counterfactual_sum_absolute_error": 1.0 + 10 * delta,
                 "intact_sum_squared_error": 0.5,
-                "shuffled_sum_squared_error": 0.5 + 10 * delta,
+                "counterfactual_sum_squared_error": 0.5 + 10 * delta,
                 "intact_mae": 0.1,
-                "shuffled_mae": 0.1 + delta,
-                "delta_mae_shuffled_minus_intact": delta,
+                "counterfactual_mae": 0.1 + delta,
+                "delta_mae_counterfactual_minus_intact": delta,
                 "intact_mse": 0.05,
-                "shuffled_mse": 0.05 + delta,
-                "delta_mse_shuffled_minus_intact": delta,
+                "counterfactual_mse": 0.05 + delta,
+                "delta_mse_counterfactual_minus_intact": delta,
                 "sum_absolute_prediction_change": 5.0,
                 "mean_absolute_prediction_change": 0.5,
                 "max_absolute_prediction_change": 1.0,
@@ -150,30 +175,32 @@ def test_paired_summary_reports_sensitivity_and_positive_shuffled_error_delta():
         bootstrap_replicates=20,
         bootstrap_seed=42,
     )
-    primary = summary[
-        (summary["scope"] == "all_tasks") & (summary["group"] == "all")
-    ].iloc[0]
+    primary = summary[(summary["scope"] == "all_tasks") & (summary["group"] == "all")].iloc[0]
 
-    assert np.isclose(primary["micro_delta_mae_shuffled_minus_intact"], 0.4)
+    assert np.isclose(primary["micro_delta_mae_counterfactual_minus_intact"], 0.4)
     assert np.isclose(primary["episode_macro_mean_delta_mae"], 0.4)
     assert np.isclose(primary["task_balanced_mean_delta_mae"], 0.45)
-    assert primary["episode_win_rate_shuffled_worse"] == 1.0
+    assert primary["episode_win_rate_counterfactual_worse"] == 1.0
     assert primary["episode_macro_prediction_change_mae"] == 0.5
 
 
-def test_runner_is_evaluation_only_and_exposes_both_geometry_interventions():
+def test_runner_is_evaluation_only_and_runs_three_interventions_for_both_models():
     runner = SCRIPT_PATH.with_name("multi_geometry_correspondence_evaluation.sh")
     text = runner.read_text(encoding="utf-8")
 
     for required in (
         'MODE="${MODE:-both}"',
         'GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")',
+        'INTERVENTIONS=("phase_matched" "out_of_phase" "zero_geometry")',
         'DATASET_SCOPE="validation"',
         'DATASET_PATH="$DATASET_ROOT/validation"',
         "--geometry-key",
+        "--intervention",
         "--shuffle-seed 42",
         "HF_HUB_OFFLINE=1",
         "PRECHECK_ONLY",
+        "validate_checkpoint_artifacts",
+        "model.safetensors.index.json",
         "nvidia-smi failed; refusing to assume the GPU is available",
         "[/]geometry_correspondence_evaluation.py",
     ):
@@ -186,3 +213,18 @@ def test_runner_is_evaluation_only_and_exposes_both_geometry_interventions():
         'DATASET_SCOPE="${DATASET_SCOPE:-',
     ):
         assert forbidden not in text
+
+
+def test_zero_geometry_frame_mapping_has_no_donor():
+    record = _record(0, "task a", length=17)
+    rows = geometry._frame_mapping(
+        [record],
+        {0: {}},
+        execution_horizon=8,
+        intervention="zero_geometry",
+    )
+
+    assert [row["recipient_frame"] for row in rows] == [0, 8, 16]
+    assert {row["replacement_source"] for row in rows} == {"all_zeros"}
+    assert all(row["donor_episode_index"] is None for row in rows)
+    assert all(row["donor_frame"] is None for row in rows)

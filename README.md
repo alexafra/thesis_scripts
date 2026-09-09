@@ -27,11 +27,12 @@ used on the robot.
 and RGB+surface-normal policies benefit from correctly aligned geometry. It is an
 evaluation-only tool and never queues itself.
 
-For every recipient episode in the held-out validation split, it selects a
-different donor episode with the exact same task. RGB, robot state, language,
-expert targets, execution horizon, and diffusion noise stay fixed. Only the depth
-or surface-normal frame is replaced in memory, using normalized episode progress
-to choose the donor frame. No training split or dataset file is changed.
+For every recipient episode in the held-out validation split, it runs three
+geometry interventions for both RGB-D and RGB+surface-normals: a different
+same-task donor at matched normalized progress, the same kind of donor shifted by
+half an episode, and an all-zero geometry frame. RGB, robot state, language,
+expert targets, execution horizon, and diffusion noise stay fixed. Replacement
+happens only in memory; no training split or dataset file is changed.
 
 Run the non-GPU readiness check:
 
@@ -41,9 +42,12 @@ MODE=both PRECHECK_ONLY=1 ./multi_geometry_correspondence_evaluation.sh
 
 Once both standard model evaluations are complete and the GPU is free, omit
 `PRECHECK_ONLY` to evaluate the best intact-validation-MAE checkpoint for each
-model. `MODE=depth` and `MODE=normals` run only one intervention. The primary
-output is task-balanced paired degradation (`shuffled - intact`); positive values
-mean correctly aligned geometry improved open-loop command prediction. The tool
-also reports ordinary frame-weighted errors, per-task results (including stack
-three cups), per-joint and horizon results, prediction sensitivity, paired
-episode-bootstrap intervals, and the exact donor/frame mapping.
+model. `MODE=depth` and `MODE=normals` restrict the three interventions to one
+model. Each intervention has its own paired intact control. The primary output is
+task-balanced paired degradation (`counterfactual - intact`); positive values
+mean the intact geometry improved open-loop command prediction. The tool also
+reports ordinary frame-weighted errors, per-task results (including stack three
+cups), per-joint and horizon results, prediction sensitivity, paired
+episode-bootstrap intervals, and the exact donor/frame mapping. All-zero geometry
+is intentionally a strong out-of-distribution ablation, while the two donor tests
+preserve more of the held-out geometry distribution.

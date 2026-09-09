@@ -25,6 +25,7 @@ SHUFFLE_REPEATS="${SHUFFLE_REPEATS:-1}"
 BOOTSTRAP_REPLICATES="${BOOTSTRAP_REPLICATES:-10000}"
 MAX_EPISODES="${MAX_EPISODES:-0}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-5}"
+INTERVENTIONS=("phase_matched" "out_of_phase" "zero_geometry")
 
 RGBD_MODEL="$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
 NORMALS_MODEL="$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
@@ -85,7 +86,8 @@ echo "Geometry correspondence evaluation preflight"
 echo "MODE=$MODE"
 echo "DATASET_PATH=$DATASET_PATH (held-out $DATASET_SCOPE only)"
 echo "CHECKPOINT_STEPS=$CHECKPOINT_STEPS"
-echo "SHUFFLE=within this held-out split, exact same task, cross-episode, in memory"
+echo "INTERVENTIONS=${INTERVENTIONS[*]} (in memory only)"
+echo "DONORS=within this held-out split, exact same task, cross-episode"
 echo "RAW_DATA_MUTATION=none"
 
 [[ -x "$GROOT_PYTHON" ]] || { echo "ERROR: missing Python: $GROOT_PYTHON" >&2; exit 1; }
@@ -129,6 +131,41 @@ print(int(best["checkpoint_step"]))
 PY
 }
 
+validate_checkpoint_artifacts() {
+    local checkpoint=$1
+    "$GROOT_PYTHON" - "$checkpoint" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+checkpoint = Path(sys.argv[1])
+required = (
+    "config.json",
+    "embodiment_id.json",
+    "processor_config.json",
+    "statistics.json",
+    "model.safetensors.index.json",
+)
+missing = [
+    name for name in required
+    if not (checkpoint / name).is_file() or (checkpoint / name).stat().st_size == 0
+]
+if missing:
+    raise SystemExit(f"Checkpoint is missing required nonempty artifacts: {missing}")
+index = json.loads((checkpoint / "model.safetensors.index.json").read_text(encoding="utf-8"))
+shards = sorted(set(index.get("weight_map", {}).values()))
+if not shards:
+    raise SystemExit("Checkpoint model index has no weight-map shards")
+bad_shards = [
+    name for name in shards
+    if not (checkpoint / name).is_file() or (checkpoint / name).stat().st_size == 0
+]
+if bad_shards:
+    raise SystemExit(f"Checkpoint model index references missing/empty shards: {bad_shards}")
+print(f"Checkpoint artifacts complete: {checkpoint.name} ({len(shards)} shards)")
+PY
+}
+
 READY=1
 SELECTED_STEPS=()
 for i in "${!MODEL_DIRS[@]}"; do
@@ -157,6 +194,7 @@ for i in "${!MODEL_DIRS[@]}"; do
             echo "ERROR: selected checkpoint is missing: $model_dir/checkpoint-$selected" >&2
             exit 1
         }
+        validate_checkpoint_artifacts "$model_dir/checkpoint-$selected"
     done
     SELECTED_STEPS+=("$step")
     echo "READY: ${LABELS[$i]} geometry=$geometry_key checkpoint(s)=$step"
@@ -188,7 +226,7 @@ PY
 
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
     if [[ "$READY" == "1" ]]; then
-        echo "PRECHECK_ONLY complete: both requested analyses are ready; nothing was launched."
+        echo "PRECHECK_ONLY complete: all requested models are ready for three interventions each; nothing was launched."
     else
         echo "PRECHECK_ONLY complete: at least one requested model is still pending; nothing was launched."
     fi
@@ -215,55 +253,68 @@ if grep -q '[0-9]' <<< "$gpu_compute_apps"; then
     exit 1
 fi
 
-printf 'model\tgeometry_key\tcheckpoint_steps\tstatus\texit_code\toutput_dir\n' > "$STATUS_FILE"
+for i in "${!MODEL_DIRS[@]}"; do
+    for intervention in "${INTERVENTIONS[@]}"; do
+        candidate="${MODEL_DIRS[$i]}/geometry_correspondence_${intervention}_${DATASET_SCOPE}_exec_hor_${EXECUTION_HORIZON}_${ANALYSIS_ID}"
+        [[ ! -e "$candidate" ]] || {
+            echo "ERROR: output already exists: $candidate" >&2
+            exit 1
+        }
+    done
+done
+
+printf 'model\tgeometry_key\tintervention\tcheckpoint_steps\tstatus\texit_code\toutput_dir\n' > "$STATUS_FILE"
 FAILURES=()
 exec > >(tee -a "$LOG_FILE") 2>&1
 cd "$GROOT_DIR"
 
+TOTAL_ANALYSES=$((${#MODEL_DIRS[@]} * ${#INTERVENTIONS[@]}))
+analysis_number=0
 for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
     step="${SELECTED_STEPS[$i]}"
-    output_dir="$model_dir/geometry_correspondence_${DATASET_SCOPE}_exec_hor_${EXECUTION_HORIZON}_${ANALYSIS_ID}"
-    [[ ! -e "$output_dir" ]] || {
-        echo "ERROR: output already exists: $output_dir" >&2
-        exit 1
-    }
     read -r -a checkpoint_args <<< "$step"
-    echo "============================================================"
-    echo "Analysis $((i + 1))/${#MODEL_DIRS[@]}: ${LABELS[$i]}"
-    echo "Model: $model_dir"
-    echo "Geometry intervention: $geometry_key only"
-    echo "Held-out split: $DATASET_PATH"
-    echo "Checkpoint(s): $step"
-    echo "Output: $output_dir"
-    echo "============================================================"
-    if CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        "$GROOT_PYTHON" "$EVALUATOR" \
-        --run-dir "$model_dir" \
-        --dataset-path "$DATASET_PATH" \
-        --output-dir "$output_dir" \
-        --geometry-key "$geometry_key" \
-        --split "$DATASET_SCOPE" \
-        --checkpoint-steps "${checkpoint_args[@]}" \
-        --embodiment-tag NEW_EMBODIMENT \
-        --execution-horizon "$EXECUTION_HORIZON" \
-        --pair-batch-size "$PAIR_BATCH_SIZE" \
-        --denoising-steps 4 \
-        --inference-seed 42 \
-        --shuffle-seed 42 \
-        --shuffle-repeats "$SHUFFLE_REPEATS" \
-        --bootstrap-replicates "$BOOTSTRAP_REPLICATES" \
-        --max-episodes "$MAX_EPISODES" \
-        --device cuda:0; then
-        printf '%s\t%s\t%s\tPASS\t0\t%s\n' \
-            "$model_dir" "$geometry_key" "$step" "$output_dir" >> "$STATUS_FILE"
-    else
-        exit_code=$?
-        printf '%s\t%s\t%s\tFAIL\t%d\t%s\n' \
-            "$model_dir" "$geometry_key" "$step" "$exit_code" "$output_dir" >> "$STATUS_FILE"
-        FAILURES+=("${LABELS[$i]} (exit $exit_code)")
-    fi
+    for intervention in "${INTERVENTIONS[@]}"; do
+        analysis_number=$((analysis_number + 1))
+        output_dir="$model_dir/geometry_correspondence_${intervention}_${DATASET_SCOPE}_exec_hor_${EXECUTION_HORIZON}_${ANALYSIS_ID}"
+        echo "============================================================"
+        echo "Analysis ${analysis_number}/${TOTAL_ANALYSES}: ${LABELS[$i]} / $intervention"
+        echo "Model: $model_dir"
+        echo "Geometry key: $geometry_key only"
+        echo "Intervention: $intervention"
+        echo "Held-out split: $DATASET_PATH"
+        echo "Checkpoint(s): $step"
+        echo "Output: $output_dir"
+        echo "============================================================"
+        if CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            "$GROOT_PYTHON" "$EVALUATOR" \
+            --run-dir "$model_dir" \
+            --dataset-path "$DATASET_PATH" \
+            --output-dir "$output_dir" \
+            --geometry-key "$geometry_key" \
+            --intervention "$intervention" \
+            --split "$DATASET_SCOPE" \
+            --checkpoint-steps "${checkpoint_args[@]}" \
+            --embodiment-tag NEW_EMBODIMENT \
+            --execution-horizon "$EXECUTION_HORIZON" \
+            --pair-batch-size "$PAIR_BATCH_SIZE" \
+            --denoising-steps 4 \
+            --inference-seed 42 \
+            --shuffle-seed 42 \
+            --shuffle-repeats "$SHUFFLE_REPEATS" \
+            --bootstrap-replicates "$BOOTSTRAP_REPLICATES" \
+            --max-episodes "$MAX_EPISODES" \
+            --device cuda:0; then
+            printf '%s\t%s\t%s\t%s\tPASS\t0\t%s\n' \
+                "$model_dir" "$geometry_key" "$intervention" "$step" "$output_dir" >> "$STATUS_FILE"
+        else
+            exit_code=$?
+            printf '%s\t%s\t%s\t%s\tFAIL\t%d\t%s\n' \
+                "$model_dir" "$geometry_key" "$intervention" "$step" "$exit_code" "$output_dir" >> "$STATUS_FILE"
+            FAILURES+=("${LABELS[$i]}/$intervention (exit $exit_code)")
+        fi
+    done
 done
 
 echo "Status: $STATUS_FILE"
