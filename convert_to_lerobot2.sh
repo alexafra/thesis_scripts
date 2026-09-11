@@ -15,7 +15,9 @@ set -Eeuo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  convert_to_lerobot2.sh [--include-surface-normals] PATH/TO/INPUT_COPY [REPO_ID] [JOBS]
+  convert_to_lerobot2.sh [--include-surface-normals] [--preflight-only] \
+      [--end-effector TYPE] \
+      PATH/TO/INPUT_COPY [REPO_ID] [JOBS]
 
 The input must be either:
   1. A disposable copy containing episode_* folders directly, or
@@ -38,6 +40,15 @@ Arguments:
                       name. Split mode adds _train, _validation, or _test.
   JOBS                H.264 transcoding jobs. Defaults to 6.
 
+Options:
+  --end-effector TYPE  Raw hand contract: dex3 (default), inspire-dfx, or
+                      inspire-ftp. Inspire is converted natively as 26D; it is
+                      never padded to the 28D Dex3 layout.
+  --include-surface-normals
+                      Add surface_normals_view and its lossless LZ4 sidecar.
+  --preflight-only     Validate all raw episodes and referenced depth files,
+                      then exit without converting or replacing anything.
+
 Environment overrides:
   UNITREE_LEROBOT_REPO  Default: ~/Development/unitree_lerobot
   ISAAC_GROOT_REPO      Default: ~/Development/Isaac-GR00T
@@ -55,10 +66,49 @@ die() {
 }
 
 INCLUDE_SURFACE_NORMALS="${INCLUDE_SURFACE_NORMALS:-0}"
-if [[ ${1:-} == "--include-surface-normals" ]]; then
-    INCLUDE_SURFACE_NORMALS=1
-    shift
-fi
+END_EFFECTOR="dex3"
+PREFLIGHT_ONLY=0
+declare -a POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --include-surface-normals)
+            INCLUDE_SURFACE_NORMALS=1
+            shift
+            ;;
+        --end-effector)
+            [[ $# -ge 2 ]] || die "--end-effector requires a value."
+            END_EFFECTOR="$2"
+            shift 2
+            ;;
+        --end-effector=*)
+            END_EFFECTOR="${1#*=}"
+            shift
+            ;;
+        --preflight-only)
+            PREFLIGHT_ONLY=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            POSITIONAL_ARGS+=("$@")
+            break
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+set -- "${POSITIONAL_ARGS[@]}"
 
 [[ $# -ge 1 && $# -le 3 ]] || { usage >&2; exit 2; }
 
@@ -99,8 +149,38 @@ UNITREE_CONVERTER="$UNITREE_LEROBOT_REPO/unitree_lerobot/utils/convert_unitree_j
 V3_TO_V2_PROJECT="$ISAAC_GROOT_REPO/scripts/lerobot_conversion"
 V3_TO_V2_SCRIPT="$V3_TO_V2_PROJECT/convert_v3_to_v2.py"
 H264_SCRIPT="$ISAAC_GROOT_REPO/examples/SimplerEnv/convert_av1_to_h264.py"
-MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality.json"
+RAW_CONTRACT_VALIDATOR="$ISAAC_GROOT_REPO/scripts/validate_unitree_raw_episode_contract.py"
 LZ4_SCRIPT="$(dirname "$(realpath "$0")")/convert_canonical_surface_normals_to_lz4.py"
+
+case "$END_EFFECTOR" in
+    dex3)
+        ROBOT_TYPE="Unitree_G1_Dex3_HeadOnly"
+        EXPECTED_HAND_DOF=7
+        EXPECTED_VECTOR_DIM=28
+        EXPECTED_RAW_TYPE="dex3"
+        EXPECTED_RAW_PROTOCOL=""
+        MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality.json"
+        ;;
+    inspire-dfx)
+        ROBOT_TYPE="Unitree_G1_Inspire_HeadOnly"
+        EXPECTED_HAND_DOF=6
+        EXPECTED_VECTOR_DIM=26
+        EXPECTED_RAW_TYPE="inspire"
+        EXPECTED_RAW_PROTOCOL="dfx"
+        MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality_inspire.json"
+        ;;
+    inspire-ftp)
+        ROBOT_TYPE="Unitree_G1_Inspire_HeadOnly"
+        EXPECTED_HAND_DOF=6
+        EXPECTED_VECTOR_DIM=26
+        EXPECTED_RAW_TYPE="inspire"
+        EXPECTED_RAW_PROTOCOL="ftp"
+        MODALITY_FILE="$ISAAC_GROOT_REPO/examples/UnitreeG1/modality_inspire.json"
+        ;;
+    *)
+        die "Unsupported --end-effector '$END_EFFECTOR'; choose dex3, inspire-dfx, or inspire-ftp."
+        ;;
+esac
 
 [[ -x "$UNITREE_PYTHON" ]] || \
     die "Unitree environment Python is missing: $UNITREE_PYTHON"
@@ -116,6 +196,9 @@ LZ4_SCRIPT="$(dirname "$(realpath "$0")")/convert_canonical_surface_normals_to_l
 
 [[ -f "$H264_SCRIPT" ]] || \
     die "AV1-to-H.264 converter is missing: $H264_SCRIPT"
+
+[[ -f "$RAW_CONTRACT_VALIDATOR" ]] || \
+    die "Raw episode contract validator is missing: $RAW_CONTRACT_VALIDATOR"
 
 [[ -f "$MODALITY_FILE" ]] || \
     die "Unitree modality file is missing: $MODALITY_FILE"
@@ -165,6 +248,29 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
     printf 'Splits:       %d\n' "${#SPLIT_DIRS[@]}"
     printf 'Base repo ID: %s\n\n' "$REPO_ID"
 
+    # Prove every split is safe before replacing the first one. Without this
+    # pass, a bad later split could be discovered only after an earlier split
+    # had already been converted in place.
+    for index in "${!SPLIT_DIRS[@]}"; do
+        split_dir="${SPLIT_DIRS[$index]}"
+        split_suffix="${SPLIT_SUFFIXES[$index]}"
+        split_repo_id="${REPO_ID}_${split_suffix}"
+        preflight_args=(--preflight-only --end-effector "$END_EFFECTOR")
+        if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
+            preflight_args+=(--include-surface-normals)
+        fi
+        bash "$SCRIPT_PATH" \
+            "${preflight_args[@]}" \
+            "$split_dir" \
+            "$split_repo_id" \
+            "$JOBS"
+    done
+
+    if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+        printf '\nAll available splits passed preflight; no files were replaced.\n'
+        exit 0
+    fi
+
     for index in "${!SPLIT_DIRS[@]}"; do
         split_dir="${SPLIT_DIRS[$index]}"
         split_suffix="${SPLIT_SUFFIXES[$index]}"
@@ -174,7 +280,15 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
             "$(basename "$split_dir")" \
             "$split_repo_id"
 
-        bash "$SCRIPT_PATH" "$split_dir" "$split_repo_id" "$JOBS"
+        recursive_args=(--end-effector "$END_EFFECTOR")
+        if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
+            recursive_args+=(--include-surface-normals)
+        fi
+        bash "$SCRIPT_PATH" \
+            "${recursive_args[@]}" \
+            "$split_dir" \
+            "$split_repo_id" \
+            "$JOBS"
     done
 
     printf '\nAll available splits converted successfully.\n'
@@ -196,6 +310,13 @@ for episode_dir in "${EPISODE_DIRS[@]}"; do
     [[ -f "$episode_dir/data.json" ]] || \
         die "Missing data.json: $episode_dir/data.json"
 done
+
+# Validate hand provenance and every state/action vector before invoking either
+# converter. Legacy Dex3 recordings may omit info.end_effector; new Inspire
+# recordings must identify DFX versus FTP explicitly.
+"$UNITREE_PYTHON" "$RAW_CONTRACT_VALIDATOR" \
+    --end-effector "$END_EFFECTOR" \
+    "${EPISODE_DIRS[@]}"
 
 "$UNITREE_PYTHON" - "$INCLUDE_SURFACE_NORMALS" "${EPISODE_DIRS[@]}" <<'PY'
 import json
@@ -246,6 +367,11 @@ for episode_arg in sys.argv[2:]:
 print(f"Validated {total_frames} referenced raw_depth_0 PNG files.")
 PY
 
+if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+    printf 'Preflight complete; no files were converted or replaced.\n'
+    exit 0
+fi
+
 WORK_DIR="$(mktemp -d -p "$TASK_DIR" '.lerobot_conversion.XXXXXX')"
 STAGED_RAW="$WORK_DIR/processed_episodes"
 STAGED_TASK="$STAGED_RAW/input_task"
@@ -280,6 +406,10 @@ done
 printf '\nInput:       %s\n' "$LEROBOT_DIR"
 printf 'Episodes:    %d\n' "${#EPISODE_DIRS[@]}"
 printf 'Repository:  %s\n' "$REPO_ID"
+printf 'End effector:%s (%dD state/action, %d DoF per hand)\n' \
+    " $END_EFFECTOR" \
+    "$EXPECTED_VECTOR_DIM" \
+    "$EXPECTED_HAND_DOF"
 if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf 'Geometry:    linear depth + camera-frame XYZ surface normals\n'
     printf 'Normals:     lossless 32-frame LZ4 chunks + H.264 backup\n'
@@ -301,7 +431,7 @@ printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
     "$UNITREE_PYTHON" "$UNITREE_CONVERTER" \
         --raw-dir "$STAGED_RAW" \
         --repo-id "$REPO_ID" \
-        --robot-type Unitree_G1_Dex3_HeadOnly \
+        --robot-type "$ROBOT_TYPE" \
         --mode video \
         --include-depth \
         --depth-near-m "$DEPTH_NEAR_M" \
@@ -375,7 +505,11 @@ fi
 
 printf '[4/6] Preserving uint16 depth PNGs losslessly...\n'
 
-"$UNITREE_PYTHON" - "$STAGED_TASK" "$V2_DATASET" "$INCLUDE_SURFACE_NORMALS" <<'PY'
+"$UNITREE_PYTHON" - \
+    "$STAGED_TASK" \
+    "$V2_DATASET" \
+    "$INCLUDE_SURFACE_NORMALS" \
+    "$END_EFFECTOR" <<'PY'
 import cv2
 import json
 from pathlib import Path
@@ -385,6 +519,7 @@ import sys
 raw_root = Path(sys.argv[1])
 dataset = Path(sys.argv[2])
 include_surface_normals = bool(int(sys.argv[3]))
+end_effector_selection = sys.argv[4]
 
 episodes = sorted(
     path for path in raw_root.iterdir()
@@ -404,10 +539,24 @@ expected_shape = None
 expected_scale = None
 copied = 0
 aligned_copied = 0
+end_effector_metadata = None
 
 for episode_index, episode in enumerate(episodes):
     with (episode / "data.json").open(encoding="utf-8") as file:
         payload = json.load(file)
+
+    episode_end_effector = payload.get("info", {}).get("end_effector")
+    if episode_end_effector is not None:
+        if end_effector_metadata is None:
+            end_effector_metadata = episode_end_effector
+        elif episode_end_effector != end_effector_metadata:
+            raise ValueError(
+                f"End-effector metadata differs between raw episodes: {episode}"
+            )
+    elif end_effector_selection != "dex3":
+        raise ValueError(
+            f"Missing info.end_effector for {end_effector_selection}: {episode}"
+        )
 
     depth_info = payload.get("info", {}).get("depth", {})
     scale = float(depth_info.get("scale_m_per_unit", 0.001))
@@ -510,6 +659,12 @@ if include_surface_normals:
         "total_files": aligned_copied,
     }
 
+if end_effector_metadata is not None:
+    # Preserve transport and normalized-value semantics in the converted
+    # dataset. This lets later checkpoint/deployment checks distinguish DFX
+    # from FTP even though both share the same native 26D model layout.
+    info["end_effector"] = end_effector_metadata
+
 with (dataset / "meta" / "info.json").open("w", encoding="utf-8") as file:
     json.dump(info, file, indent=4)
     file.write("\n")
@@ -532,7 +687,12 @@ printf '[6/6] Validating metadata, episode count, raw depth and video codecs...\
     "${#EPISODE_DIRS[@]}" \
     "$DEPTH_NEAR_M" \
     "$DEPTH_FAR_M" \
-    "$INCLUDE_SURFACE_NORMALS" <<'PY'
+    "$INCLUDE_SURFACE_NORMALS" \
+    "$ROBOT_TYPE" \
+    "$EXPECTED_VECTOR_DIM" \
+    "$EXPECTED_HAND_DOF" \
+    "$EXPECTED_RAW_TYPE" \
+    "$EXPECTED_RAW_PROTOCOL" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -542,12 +702,17 @@ expected_episodes = int(sys.argv[2])
 expected_depth_near_m = float(sys.argv[3])
 expected_depth_far_m = float(sys.argv[4])
 include_surface_normals = bool(int(sys.argv[5]))
+expected_robot_type = sys.argv[6]
+expected_vector_dim = int(sys.argv[7])
+expected_hand_dof = int(sys.argv[8])
+expected_raw_type = sys.argv[9]
+expected_raw_protocol = sys.argv[10] or None
 
 with (dataset / "meta" / "info.json").open(encoding="utf-8") as file:
     info = json.load(file)
 
 assert info["codebase_version"] == "v2.1", info["codebase_version"]
-assert info["robot_type"] == "Unitree_G1_Dex3_HeadOnly", info["robot_type"]
+assert info["robot_type"] == expected_robot_type, info["robot_type"]
 assert info["total_episodes"] == expected_episodes, (
     info["total_episodes"],
     expected_episodes,
@@ -556,8 +721,8 @@ assert (dataset / "meta" / "modality.json").is_file()
 
 features = info["features"]
 
-assert features["observation.state"]["shape"] == [28]
-assert features["action"]["shape"] == [28]
+assert features["observation.state"]["shape"] == [expected_vector_dim]
+assert features["action"]["shape"] == [expected_vector_dim]
 assert "observation.images.ego_view" in features
 assert "observation.images.depth_gray_view" in features
 assert features["observation.images.ego_view"]["dtype"] == "video"
@@ -612,6 +777,28 @@ for episode_index, episode in enumerate(episodes):
 
 with (dataset / "meta" / "modality.json").open(encoding="utf-8") as file:
     modality = json.load(file)
+
+expected_layout = {
+    "left_arm": {"start": 0, "end": 7},
+    "right_arm": {"start": 7, "end": 14},
+    "left_hand": {"start": 14, "end": 14 + expected_hand_dof},
+    "right_hand": {
+        "start": 14 + expected_hand_dof,
+        "end": expected_vector_dim,
+    },
+}
+assert modality["state"] == expected_layout, modality["state"]
+assert modality["action"] == expected_layout, modality["action"]
+
+end_effector_metadata = info.get("end_effector")
+if expected_raw_protocol is not None:
+    assert isinstance(end_effector_metadata, dict), end_effector_metadata
+    assert end_effector_metadata.get("type") == expected_raw_type
+    assert end_effector_metadata.get("protocol") == expected_raw_protocol
+    assert end_effector_metadata.get("hand_dof") == expected_hand_dof
+elif end_effector_metadata is not None:
+    assert end_effector_metadata.get("type") == expected_raw_type
+    assert end_effector_metadata.get("hand_dof") == expected_hand_dof
 
 assert modality["video"]["ego_view"]["original_key"] == (
     "observation.images.ego_view"
