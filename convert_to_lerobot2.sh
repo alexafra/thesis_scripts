@@ -10,12 +10,14 @@ set -Eeuo pipefail
 #   train/  validation/  test/
 # Each present split is converted independently and remains a separate folder.
 # Raw uint16 depth PNGs are preserved losslessly alongside the standard video
-# features under raw_depths/chunk-*/episode_*/frame_*.png.
+# features under raw_depths/chunk-*/episode_*/frame_*.png unless the explicit
+# one-off --color-only mode is selected.
 
 usage() {
     cat <<'EOF'
 Usage:
-  convert_to_lerobot2.sh [--include-surface-normals] [--preflight-only] \
+  convert_to_lerobot2.sh [--color-only] [--include-surface-normals] \
+      [--preflight-only] \
       [--end-effector TYPE] \
       PATH/TO/INPUT_COPY [REPO_ID] [JOBS]
 
@@ -46,7 +48,10 @@ Options:
                       never padded to the 28D Dex3 layout.
   --include-surface-normals
                       Add surface_normals_view and its lossless LZ4 sidecar.
-  --preflight-only     Validate all raw episodes and referenced depth files,
+  --color-only         Convert only color_0. This is an explicit opt-in for
+                      recordings with no depth; normal RGB-D behavior remains
+                      the default. It cannot be combined with surface normals.
+  --preflight-only     Validate all raw episodes and referenced media files,
                       then exit without converting or replacing anything.
 
 Environment overrides:
@@ -66,6 +71,7 @@ die() {
 }
 
 INCLUDE_SURFACE_NORMALS="${INCLUDE_SURFACE_NORMALS:-0}"
+COLOR_ONLY=0
 END_EFFECTOR="dex3"
 PREFLIGHT_ONLY=0
 declare -a POSITIONAL_ARGS=()
@@ -74,6 +80,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --include-surface-normals)
             INCLUDE_SURFACE_NORMALS=1
+            shift
+            ;;
+        --color-only)
+            COLOR_ONLY=1
             shift
             ;;
         --end-effector)
@@ -144,6 +154,10 @@ DEPTH_FAR_M="${DEPTH_FAR_M:-1.0}"
 [[ "$INCLUDE_SURFACE_NORMALS" == 0 || "$INCLUDE_SURFACE_NORMALS" == 1 ]] || \
     die "INCLUDE_SURFACE_NORMALS must be 0 or 1."
 export INCLUDE_SURFACE_NORMALS
+
+if [[ "$COLOR_ONLY" == 1 && "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
+    die "--color-only cannot be combined with --include-surface-normals because normals require depth."
+fi
 
 UNITREE_CONVERTER="$UNITREE_LEROBOT_REPO/unitree_lerobot/utils/convert_unitree_json_to_lerobot.py"
 V3_TO_V2_PROJECT="$ISAAC_GROOT_REPO/scripts/lerobot_conversion"
@@ -256,6 +270,9 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
         split_suffix="${SPLIT_SUFFIXES[$index]}"
         split_repo_id="${REPO_ID}_${split_suffix}"
         preflight_args=(--preflight-only --end-effector "$END_EFFECTOR")
+        if [[ "$COLOR_ONLY" == 1 ]]; then
+            preflight_args+=(--color-only)
+        fi
         if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
             preflight_args+=(--include-surface-normals)
         fi
@@ -281,6 +298,9 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
             "$split_repo_id"
 
         recursive_args=(--end-effector "$END_EFFECTOR")
+        if [[ "$COLOR_ONLY" == 1 ]]; then
+            recursive_args+=(--color-only)
+        fi
         if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
             recursive_args+=(--include-surface-normals)
         fi
@@ -294,6 +314,23 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
     printf '\nAll available splits converted successfully.\n'
     printf 'Split dataset root: %s\n' "$LEROBOT_DIR"
     exit 0
+fi
+
+# A direct root must be deliberately flat. Silently ignoring categorized or
+# otherwise nested episodes is much more dangerous than failing: category
+# names can encode different tasks or failed demonstrations, and episode IDs
+# can collide across sessions.
+mapfile -d '' NESTED_EPISODE_JSONS < <(
+    find "$LEROBOT_DIR" \
+        -mindepth 3 \
+        -type f \
+        -name data.json \
+        -path '*/episode_*/data.json' \
+        -print0 |
+    sort -z
+)
+if [[ ${#NESTED_EPISODE_JSONS[@]} -gt 0 ]]; then
+    die "Nested episode folders are not consumed automatically (first: ${NESTED_EPISODE_JSONS[0]}). Build an explicit flat disposable staging root so task labels and duplicate episode IDs are resolved deliberately."
 fi
 
 EPISODE_DIRS=("${DIRECT_EPISODE_DIRS[@]}")
@@ -318,14 +355,43 @@ done
     --end-effector "$END_EFFECTOR" \
     "${EPISODE_DIRS[@]}"
 
-"$UNITREE_PYTHON" - "$INCLUDE_SURFACE_NORMALS" "${EPISODE_DIRS[@]}" <<'PY'
+"$UNITREE_PYTHON" - \
+    "$COLOR_ONLY" \
+    "$INCLUDE_SURFACE_NORMALS" \
+    "${EPISODE_DIRS[@]}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-include_surface_normals = bool(int(sys.argv[1]))
+color_only = bool(int(sys.argv[1]))
+include_depth = not color_only
+include_surface_normals = bool(int(sys.argv[2]))
 total_frames = 0
-for episode_arg in sys.argv[2:]:
+validated = {"color_0": 0, "depth_0": 0, "raw_depth_0": 0}
+
+
+def require_media(episode, frame, frame_index, section, key):
+    section_value = frame.get(section) or {}
+    if not isinstance(section_value, dict):
+        raise ValueError(
+            f"Invalid {section} object in {episode}/data.json frame {frame_index}"
+        )
+    relative = section_value.get(key)
+    if not relative:
+        raise ValueError(
+            f"Missing {section}.{key} in {episode}/data.json frame {frame_index}"
+        )
+    media_path = (episode / relative).resolve()
+    try:
+        media_path.relative_to(episode)
+    except ValueError as exc:
+        raise ValueError(f"{key} path escapes its episode: {relative}") from exc
+    if not media_path.is_file():
+        raise FileNotFoundError(f"Missing {key} media file: {media_path}")
+    validated[key] += 1
+
+
+for episode_arg in sys.argv[3:]:
     episode = Path(episode_arg).resolve()
     with (episode / "data.json").open(encoding="utf-8") as file:
         payload = json.load(file)
@@ -335,36 +401,24 @@ for episode_arg in sys.argv[2:]:
         raise ValueError(f"Episode contains no frames: {episode}")
 
     for frame_index, frame in enumerate(frames):
-        relative = (frame.get("depths") or {}).get("raw_depth_0")
-        if not relative:
+        if not isinstance(frame, dict):
             raise ValueError(
-                f"Missing depths.raw_depth_0 in {episode}/data.json frame {frame_index}"
+                f"Invalid frame object in {episode}/data.json frame {frame_index}"
             )
-        raw_path = (episode / relative).resolve()
-        try:
-            raw_path.relative_to(episode)
-        except ValueError as exc:
-            raise ValueError(f"Raw-depth path escapes its episode: {relative}") from exc
-        if not raw_path.is_file():
-            raise FileNotFoundError(f"Missing raw-depth PNG: {raw_path}")
-        if include_surface_normals:
-            aligned_relative = (frame.get("depths") or {}).get("depth_0")
-            if not aligned_relative:
-                raise ValueError(
-                    f"Missing depths.depth_0 in {episode}/data.json frame {frame_index}"
-                )
-            aligned_path = (episode / aligned_relative).resolve()
-            try:
-                aligned_path.relative_to(episode)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Aligned-depth path escapes its episode: {aligned_relative}"
-                ) from exc
-            if not aligned_path.is_file():
-                raise FileNotFoundError(f"Missing aligned-depth PNG: {aligned_path}")
+        require_media(episode, frame, frame_index, "colors", "color_0")
+        if include_depth:
+            # The normal RGB-D converter consumes aligned depth_0, while the
+            # wrapper additionally preserves raw_depth_0 losslessly.
+            require_media(episode, frame, frame_index, "depths", "depth_0")
+            require_media(episode, frame, frame_index, "depths", "raw_depth_0")
     total_frames += len(frames)
 
-print(f"Validated {total_frames} referenced raw_depth_0 PNG files.")
+mode = "color-only" if color_only else "RGB-D"
+print(
+    f"Validated {total_frames} {mode} frames: "
+    + ", ".join(f"{key}={count}" for key, count in validated.items() if count)
+    + "."
+)
 PY
 
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
@@ -413,17 +467,30 @@ printf 'End effector:%s (%dD state/action, %d DoF per hand)\n' \
 if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf 'Geometry:    linear depth + camera-frame XYZ surface normals\n'
     printf 'Normals:     lossless 32-frame LZ4 chunks + H.264 backup\n'
+elif [[ "$COLOR_ONLY" == 1 ]]; then
+    printf 'Visual input: color_0 only (explicit one-off mode; no depth)\n'
 fi
-printf 'Final form:  LeRobot v2.1 with byte-exact H.264 geometry and lossless depth sidecars\n\n'
+if [[ "$COLOR_ONLY" == 1 ]]; then
+    printf 'Final form:  LeRobot v2.1 with RGB H.264 only\n\n'
+else
+    printf 'Final form:  LeRobot v2.1 with byte-exact H.264 geometry and lossless depth sidecars\n\n'
+fi
 
 printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
 
 (
     cd "$UNITREE_LEROBOT_REPO"
 
-    SURFACE_NORMAL_ARGS=()
+    MEDIA_ARGS=()
+    if [[ "$COLOR_ONLY" == 0 ]]; then
+        MEDIA_ARGS+=(
+            --include-depth
+            --depth-near-m "$DEPTH_NEAR_M"
+            --depth-far-m "$DEPTH_FAR_M"
+        )
+    fi
     if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
-        SURFACE_NORMAL_ARGS+=(--include-surface-normals)
+        MEDIA_ARGS+=(--include-surface-normals)
     fi
 
     HF_HOME="$HF_HOME_TEMP" \
@@ -433,10 +500,7 @@ printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
         --repo-id "$REPO_ID" \
         --robot-type "$ROBOT_TYPE" \
         --mode video \
-        --include-depth \
-        --depth-near-m "$DEPTH_NEAR_M" \
-        --depth-far-m "$DEPTH_FAR_M" \
-        "${SURFACE_NORMAL_ARGS[@]}"
+        "${MEDIA_ARGS[@]}"
 )
 
 [[ -d "$V3_DATASET" ]] || \
@@ -503,11 +567,16 @@ if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
         --chunk-frames 32
 fi
 
-printf '[4/6] Preserving uint16 depth PNGs losslessly...\n'
+if [[ "$COLOR_ONLY" == 1 ]]; then
+    printf '[4/6] Preserving end-effector provenance (no depth selected)...\n'
+else
+    printf '[4/6] Preserving uint16 depth PNGs losslessly...\n'
+fi
 
 "$UNITREE_PYTHON" - \
     "$STAGED_TASK" \
     "$V2_DATASET" \
+    "$COLOR_ONLY" \
     "$INCLUDE_SURFACE_NORMALS" \
     "$END_EFFECTOR" <<'PY'
 import cv2
@@ -518,8 +587,10 @@ import sys
 
 raw_root = Path(sys.argv[1])
 dataset = Path(sys.argv[2])
-include_surface_normals = bool(int(sys.argv[3]))
-end_effector_selection = sys.argv[4]
+color_only = bool(int(sys.argv[3]))
+include_depth = not color_only
+include_surface_normals = bool(int(sys.argv[4]))
+end_effector_selection = sys.argv[5]
 
 episodes = sorted(
     path for path in raw_root.iterdir()
@@ -558,21 +629,23 @@ for episode_index, episode in enumerate(episodes):
             f"Missing info.end_effector for {end_effector_selection}: {episode}"
         )
 
-    depth_info = payload.get("info", {}).get("depth", {})
-    scale = float(depth_info.get("scale_m_per_unit", 0.001))
-    shape = (int(depth_info.get("height", 480)), int(depth_info.get("width", 640)))
-    if expected_scale is None:
-        expected_scale = scale
-        expected_shape = shape
-    if scale != expected_scale or shape != expected_shape:
-        raise ValueError(
-            f"Raw-depth metadata differs in {episode}: "
-            f"scale={scale}, shape={shape}; expected scale={expected_scale}, "
-            f"shape={expected_shape}"
-        )
+    if include_depth:
+        depth_info = payload.get("info", {}).get("depth", {})
+        scale = float(depth_info.get("scale_m_per_unit", 0.001))
+        shape = (int(depth_info.get("height", 480)), int(depth_info.get("width", 640)))
+        if expected_scale is None:
+            expected_scale = scale
+            expected_shape = shape
+        if scale != expected_scale or shape != expected_shape:
+            raise ValueError(
+                f"Raw-depth metadata differs in {episode}: "
+                f"scale={scale}, shape={shape}; expected scale={expected_scale}, "
+                f"shape={expected_shape}"
+            )
 
-    frames = payload["data"]
-    for frame_index, frame in enumerate(frames):
+    for frame_index, frame in enumerate(payload["data"]):
+        if not include_depth:
+            continue
         relative = (frame.get("depths") or {}).get("raw_depth_0")
         if not relative:
             raise ValueError(f"Missing raw_depth_0 in {episode}, frame {frame_index}")
@@ -621,22 +694,25 @@ for episode_index, episode in enumerate(episodes):
             shutil.copy2(aligned_source, aligned_destination)
             aligned_copied += 1
 
-if copied != int(info["total_frames"]):
-    raise ValueError(f"Raw-depth frame mismatch: copied {copied}, expected {info['total_frames']}")
+if include_depth:
+    if copied != int(info["total_frames"]):
+        raise ValueError(
+            f"Raw-depth frame mismatch: copied {copied}, expected {info['total_frames']}"
+        )
 
-info["raw_depth_encoding"] = {
-    "source_key": "raw_depth_0",
-    "storage": "lossless_png",
-    "path": (
-        "raw_depths/chunk-{episode_chunk:03d}/"
-        "episode_{episode_index:06d}/frame_{frame_index:06d}.png"
-    ),
-    "dtype": "uint16",
-    "shape": list(expected_shape),
-    "scale_m_per_unit": expected_scale,
-    "invalid_value": 0,
-    "total_files": copied,
-}
+    info["raw_depth_encoding"] = {
+        "source_key": "raw_depth_0",
+        "storage": "lossless_png",
+        "path": (
+            "raw_depths/chunk-{episode_chunk:03d}/"
+            "episode_{episode_index:06d}/frame_{frame_index:06d}.png"
+        ),
+        "dtype": "uint16",
+        "shape": list(expected_shape),
+        "scale_m_per_unit": expected_scale,
+        "invalid_value": 0,
+        "total_files": copied,
+    }
 
 if include_surface_normals:
     if aligned_copied != int(info["total_frames"]):
@@ -669,7 +745,10 @@ with (dataset / "meta" / "info.json").open("w", encoding="utf-8") as file:
     json.dump(info, file, indent=4)
     file.write("\n")
 
-print(f"Preserved {copied} lossless raw-depth PNG files.")
+if include_depth:
+    print(f"Preserved {copied} lossless raw-depth PNG files.")
+else:
+    print("Preserved end-effector provenance; depth was intentionally omitted.")
 if include_surface_normals:
     print(f"Preserved {aligned_copied} lossless aligned-depth PNG files.")
 PY
@@ -680,13 +759,35 @@ install -m 0644 \
     "$MODALITY_FILE" \
     "$V2_DATASET/meta/modality.json"
 
-printf '[6/6] Validating metadata, episode count, raw depth and video codecs...\n'
+if [[ "$COLOR_ONLY" == "1" ]]; then
+    "$UNITREE_PYTHON" - "$V2_DATASET/meta/modality.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as file:
+    modality = json.load(file)
+
+ego_view = modality.get("video", {}).get("ego_view")
+if not isinstance(ego_view, dict):
+    raise SystemExit("Color-only modality is missing video.ego_view")
+modality["video"] = {"ego_view": ego_view}
+
+with path.open("w", encoding="utf-8") as file:
+    json.dump(modality, file, indent=4)
+    file.write("\n")
+PY
+fi
+
+printf '[6/6] Validating metadata, episode count, selected media and video codecs...\n'
 
 "$UNITREE_PYTHON" - \
     "$V2_DATASET" \
     "${#EPISODE_DIRS[@]}" \
     "$DEPTH_NEAR_M" \
     "$DEPTH_FAR_M" \
+    "$COLOR_ONLY" \
     "$INCLUDE_SURFACE_NORMALS" \
     "$ROBOT_TYPE" \
     "$EXPECTED_VECTOR_DIM" \
@@ -701,12 +802,14 @@ dataset = Path(sys.argv[1])
 expected_episodes = int(sys.argv[2])
 expected_depth_near_m = float(sys.argv[3])
 expected_depth_far_m = float(sys.argv[4])
-include_surface_normals = bool(int(sys.argv[5]))
-expected_robot_type = sys.argv[6]
-expected_vector_dim = int(sys.argv[7])
-expected_hand_dof = int(sys.argv[8])
-expected_raw_type = sys.argv[9]
-expected_raw_protocol = sys.argv[10] or None
+color_only = bool(int(sys.argv[5]))
+include_depth = not color_only
+include_surface_normals = bool(int(sys.argv[6]))
+expected_robot_type = sys.argv[7]
+expected_vector_dim = int(sys.argv[8])
+expected_hand_dof = int(sys.argv[9])
+expected_raw_type = sys.argv[10]
+expected_raw_protocol = sys.argv[11] or None
 
 with (dataset / "meta" / "info.json").open(encoding="utf-8") as file:
     info = json.load(file)
@@ -724,24 +827,36 @@ features = info["features"]
 assert features["observation.state"]["shape"] == [expected_vector_dim]
 assert features["action"]["shape"] == [expected_vector_dim]
 assert "observation.images.ego_view" in features
-assert "observation.images.depth_gray_view" in features
 assert features["observation.images.ego_view"]["dtype"] == "video"
-assert features["observation.images.depth_gray_view"]["dtype"] == "video"
+if include_depth:
+    assert "observation.images.depth_gray_view" in features
+    assert features["observation.images.depth_gray_view"]["dtype"] == "video"
+else:
+    assert "observation.images.depth_gray_view" not in features
 if include_surface_normals:
     assert "observation.images.surface_normals_view" in features
     assert features["observation.images.surface_normals_view"]["dtype"] == "video"
 
-depth_encoding = info["depth_encoding"]
-assert depth_encoding["feature_key"] == "observation.images.depth_gray_view"
-assert depth_encoding["near_m"] == expected_depth_near_m
-assert depth_encoding["far_m"] == expected_depth_far_m
+if include_depth:
+    depth_encoding = info["depth_encoding"]
+    assert depth_encoding["feature_key"] == "observation.images.depth_gray_view"
+    assert depth_encoding["near_m"] == expected_depth_near_m
+    assert depth_encoding["far_m"] == expected_depth_far_m
 
-raw_depth_encoding = info["raw_depth_encoding"]
-assert raw_depth_encoding["source_key"] == "raw_depth_0"
-assert raw_depth_encoding["storage"] == "lossless_png"
-assert raw_depth_encoding["dtype"] == "uint16"
-assert raw_depth_encoding["shape"] == [480, 640]
-assert raw_depth_encoding["total_files"] == info["total_frames"]
+    raw_depth_encoding = info["raw_depth_encoding"]
+    assert raw_depth_encoding["source_key"] == "raw_depth_0"
+    assert raw_depth_encoding["storage"] == "lossless_png"
+    assert raw_depth_encoding["dtype"] == "uint16"
+    assert raw_depth_encoding["shape"] == [480, 640]
+    assert raw_depth_encoding["total_files"] == info["total_frames"]
+else:
+    assert "depth_encoding" not in info
+    assert "raw_depth_encoding" not in info
+    assert "aligned_depth_encoding" not in info
+    assert "surface_normals_encoding" not in info
+    assert "surface_normals_lz4" not in info
+    assert not (dataset / "raw_depths").exists()
+    assert not (dataset / "aligned_depths").exists()
 
 if include_surface_normals:
     surface_encoding = info["surface_normals_encoding"]
@@ -760,20 +875,21 @@ if include_surface_normals:
     assert aligned_depth_encoding["shape"] == [480, 640]
     assert aligned_depth_encoding["total_files"] == info["total_frames"]
 
-raw_depth_template = raw_depth_encoding["path"]
 chunks_size = int(info["chunks_size"])
 episodes = list(
     json.loads(line)
     for line in (dataset / "meta" / "episodes.jsonl").read_text().splitlines()
 )
-for episode_index, episode in enumerate(episodes):
-    for frame_index in range(int(episode["length"])):
-        raw_depth = dataset / raw_depth_template.format(
-            episode_chunk=episode_index // chunks_size,
-            episode_index=episode_index,
-            frame_index=frame_index,
-        )
-        assert raw_depth.is_file(), raw_depth
+if include_depth:
+    raw_depth_template = raw_depth_encoding["path"]
+    for episode_index, episode in enumerate(episodes):
+        for frame_index in range(int(episode["length"])):
+            raw_depth = dataset / raw_depth_template.format(
+                episode_chunk=episode_index // chunks_size,
+                episode_index=episode_index,
+                frame_index=frame_index,
+            )
+            assert raw_depth.is_file(), raw_depth
 
 with (dataset / "meta" / "modality.json").open(encoding="utf-8") as file:
     modality = json.load(file)
@@ -803,9 +919,12 @@ elif end_effector_metadata is not None:
 assert modality["video"]["ego_view"]["original_key"] == (
     "observation.images.ego_view"
 )
-assert modality["video"]["depth_gray_view"]["original_key"] == (
-    "observation.images.depth_gray_view"
-)
+if color_only:
+    assert set(modality["video"]) == {"ego_view"}, modality["video"]
+else:
+    assert modality["video"]["depth_gray_view"]["original_key"] == (
+        "observation.images.depth_gray_view"
+    )
 if include_surface_normals:
     assert modality["video"]["surface_normals_view"]["original_key"] == (
         "observation.images.surface_normals_view"
@@ -848,8 +967,22 @@ if include_surface_normals:
             )
             assert (index_path.parent / chunk["filename"]).is_file()
 
-feature_keys = ["observation.images.ego_view", "observation.images.depth_gray_view"]
-for feature_key in feature_keys:
+declared_video_feature_keys = ["observation.images.ego_view"]
+mp4_feature_keys = ["observation.images.ego_view"]
+if include_depth:
+    declared_video_feature_keys.append("observation.images.depth_gray_view")
+    mp4_feature_keys.append("observation.images.depth_gray_view")
+if include_surface_normals:
+    declared_video_feature_keys.append("observation.images.surface_normals_view")
+
+actual_video_features = {
+    key for key, feature in features.items() if feature.get("dtype") == "video"
+}
+assert actual_video_features == set(declared_video_feature_keys), (
+    actual_video_features,
+    set(declared_video_feature_keys),
+)
+for feature_key in mp4_feature_keys:
     videos = list((dataset / "videos").glob(f"chunk-*/{feature_key}/episode_*.mp4"))
     assert len(videos) == expected_episodes, (feature_key, len(videos), expected_episodes)
 
