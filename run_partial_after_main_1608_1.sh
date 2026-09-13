@@ -3,8 +3,10 @@ set -euo pipefail
 
 CURRENT_UNIT="groot-partial-multi-1608-1.service"
 PARTIAL_SCRIPT="/home/alex/Development/scripts/partial_multi_finetune_evaluation.sh"
-LOG_FILE="/home/alex/Development/partial_multi_finetune_evaluation_20k_1608_1.log"
-STATUS_FILE="/home/alex/Development/partial_multi_finetune_evaluation_20k_1608_1_status.tsv"
+LOG_ROOT="/home/alex/Development/logs/groot/training"
+mkdir -p "$LOG_ROOT"
+LOG_FILE="$LOG_ROOT/partial_multi_finetune_evaluation_20k_1608_1.log"
+STATUS_FILE="$LOG_ROOT/partial_multi_finetune_evaluation_20k_1608_1_status.tsv"
 POLL_SECONDS=20
 
 exec >> "$LOG_FILE" 2>&1

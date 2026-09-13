@@ -4,8 +4,10 @@ set -uo pipefail
 cd /home/alex/Development/Isaac-GR00T
 
 OUTPUT=/home/alex/Development/Models/c_normals_separate_patch_tuned_bf16_batch_32_acc_1_chunk_32_gc_1608_1_test
-LOG=/home/alex/Development/surface_normals_separate_batch32_gc_smoke_1608_1.log
-STATUS=/home/alex/Development/surface_normals_separate_batch32_gc_smoke_1608_1_status.tsv
+LOG_ROOT=/home/alex/Development/logs/groot/smoke
+mkdir -p "$LOG_ROOT"
+LOG=$LOG_ROOT/surface_normals_separate_batch32_gc_smoke_1608_1.log
+STATUS=$LOG_ROOT/surface_normals_separate_batch32_gc_smoke_1608_1_status.tsv
 
 exec >>"$LOG" 2>&1
 printf 'model\tstatus\texit_code\n' > "$STATUS"

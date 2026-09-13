@@ -3,8 +3,10 @@ set -uo pipefail
 
 cd /home/alex/Development/Isaac-GR00T
 
-LOG=/home/alex/Development/surface_normals_separate_patch_frozen_smoke_1608_1.log
-STATUS=/home/alex/Development/surface_normals_separate_patch_frozen_smoke_1608_1_status.tsv
+LOG_ROOT=/home/alex/Development/logs/groot/smoke
+mkdir -p "$LOG_ROOT"
+LOG=$LOG_ROOT/surface_normals_separate_patch_frozen_smoke_1608_1.log
+STATUS=$LOG_ROOT/surface_normals_separate_patch_frozen_smoke_1608_1_status.tsv
 CONFIG=examples/UnitreeG1/g1_dex3_head_3_channel_surface_normals_config.py
 
 OUTPUTS=(

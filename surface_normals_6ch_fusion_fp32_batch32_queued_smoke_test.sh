@@ -5,8 +5,10 @@ cd /home/alex/Development/Isaac-GR00T
 
 DATASET=/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train
 BASE_MODEL=/home/alex/Development/Models/GR00T-N1.7-3B
-LOG=/home/alex/Development/surface_normals_6ch_fusion_fp32_batch32_zero_smoke_retry1_1708_2.log
-STATUS=/home/alex/Development/surface_normals_6ch_fusion_fp32_batch32_zero_smoke_retry1_1708_2_status.tsv
+LOG_ROOT=/home/alex/Development/logs/groot/smoke
+mkdir -p "$LOG_ROOT"
+LOG=$LOG_ROOT/surface_normals_6ch_fusion_fp32_batch32_zero_smoke_retry1_1708_2.log
+STATUS=$LOG_ROOT/surface_normals_6ch_fusion_fp32_batch32_zero_smoke_retry1_1708_2_status.tsv
 
 exec >>"$LOG" 2>&1
 
