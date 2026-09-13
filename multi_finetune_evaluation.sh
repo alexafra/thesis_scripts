@@ -6,11 +6,13 @@ cd "$HOME/Development/Isaac-GR00T"
 DATASET_ROOT="${DATASET_ROOT:-/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08}"
 TRAIN_DATASET="${TRAIN_DATASET:-$DATASET_ROOT/train}"
 VALIDATION_DATASET="${VALIDATION_DATASET:-$DATASET_ROOT/validation}"
+TEST_DATASET="${TEST_DATASET:-$DATASET_ROOT/test}"
 BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 DRY_RUN="${DRY_RUN:-0}"
 PRECHECK_ONLY="${PRECHECK_ONLY:-0}"
+EXPERIMENTS="${EXPERIMENTS:-rgb,normals,depth}"
 LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
 mkdir -p "$LOG_ROOT"
 
@@ -44,6 +46,10 @@ esac
 
 RUN_SUFFIX="${RUN_SUFFIX:-$DEFAULT_RUN_SUFFIX}"
 MODEL_PREFIX="${MODEL_PREFIX:-$DEFAULT_MODEL_PREFIX}"
+[[ "$MODEL_PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] || {
+    echo "Error: invalid MODEL_PREFIX: $MODEL_PREFIX" >&2
+    exit 1
+}
 if [[ "$PRECHECK_ONLY" != "0" && "$PRECHECK_ONLY" != "1" ]]; then
     echo "Error: PRECHECK_ONLY must be 0 or 1." >&2
     exit 1
@@ -67,7 +73,6 @@ else
 fi
 
 EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$LOG_ROOT/multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
-printf 'stage\tmodel\tstatus\texit_code\n' > "$EVALUATION_STATUS_FILE"
 TRAINING_FAILURES=()
 EVALUATION_FAILURES=()
 
@@ -94,6 +99,34 @@ BATCH_SIZES=(32 32 32)
 ACCUMULATION_STEPS=(1 1 1)
 PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean")
 INCLUDE_BASE_MODEL=(1 0 0)
+EXPERIMENT_NAMES=(rgb depth normals)
+
+SELECTED_INDICES=()
+SELECTED_EXPERIMENTS=()
+declare -A SELECTED_EXPERIMENT_SET=()
+IFS=',' read -r -a REQUESTED_EXPERIMENTS <<< "$EXPERIMENTS"
+for experiment in "${REQUESTED_EXPERIMENTS[@]}"; do
+    case "$experiment" in
+        rgb) index=0 ;;
+        depth) index=1 ;;
+        normals) index=2 ;;
+        *)
+            echo "Error: EXPERIMENTS entries must be rgb, depth, or normals; got: $experiment" >&2
+            exit 1
+            ;;
+    esac
+    if [[ -n "${SELECTED_EXPERIMENT_SET[$experiment]:-}" ]]; then
+        echo "Error: duplicate EXPERIMENTS entry: $experiment" >&2
+        exit 1
+    fi
+    SELECTED_EXPERIMENT_SET[$experiment]=1
+    SELECTED_INDICES+=("$index")
+    SELECTED_EXPERIMENTS+=("$experiment")
+done
+if [[ ${#SELECTED_INDICES[@]} -eq 0 ]]; then
+    echo "Error: EXPERIMENTS must select at least one experiment." >&2
+    exit 1
+fi
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_EMBED_FLAGS[@]} ||
@@ -101,20 +134,26 @@ if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#BATCH_SIZES[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#ACCUMULATION_STEPS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_INIT_MODES[@]} ||
-      ${#MODALITY_CONFIGS[@]} -ne ${#INCLUDE_BASE_MODEL[@]} ]]; then
+      ${#MODALITY_CONFIGS[@]} -ne ${#INCLUDE_BASE_MODEL[@]} ||
+      ${#MODALITY_CONFIGS[@]} -ne ${#EXPERIMENT_NAMES[@]} ]]; then
     echo "Error: experiment arrays must have the same number of entries." >&2
     exit 1
 fi
 
-for dataset in "$TRAIN_DATASET" "$VALIDATION_DATASET"; do
+REQUIRED_FEATURES=(observation.images.ego_view)
+if [[ -n "${SELECTED_EXPERIMENT_SET[depth]:-}" ]]; then
+    REQUIRED_FEATURES+=(observation.images.depth_gray_view)
+fi
+if [[ -n "${SELECTED_EXPERIMENT_SET[normals]:-}" ]]; then
+    REQUIRED_FEATURES+=(observation.images.surface_normals_view)
+fi
+
+for dataset in "$TRAIN_DATASET" "$VALIDATION_DATASET" "$TEST_DATASET"; do
     if [[ ! -f "$dataset/meta/info.json" ]]; then
         echo "Error: dataset is not ready: $dataset/meta/info.json is missing." >&2
         exit 1
     fi
-    for feature in \
-        observation.images.ego_view \
-        observation.images.depth_gray_view \
-        observation.images.surface_normals_view; do
+    for feature in "${REQUIRED_FEATURES[@]}"; do
         if ! grep -Fq "\"$feature\"" "$dataset/meta/info.json"; then
             echo "Error: $dataset is missing required feature $feature." >&2
             exit 1
@@ -126,19 +165,21 @@ for dataset in "$TRAIN_DATASET" "$VALIDATION_DATASET"; do
             "$dataset/meta/info.json"
     )"
     if [[ "$dataset_robot_type" != "$DATASET_ROBOT_TYPE" ]]; then
-        echo "Error: train/validation robot_type mismatch: $dataset_robot_type" >&2
+        echo "Error: train/validation/test robot_type mismatch: $dataset_robot_type" >&2
         exit 1
     fi
 done
 
-for path in "${MODALITY_CONFIGS[@]}"; do
+for i in "${SELECTED_INDICES[@]}"; do
+    path="${MODALITY_CONFIGS[$i]}"
     if [[ ! -f "$path" ]]; then
         echo "Error: modality config does not exist: $path" >&2
         exit 1
     fi
 done
 
-for path in "${MODEL_DIRS[@]}"; do
+for i in "${SELECTED_INDICES[@]}"; do
+    path="${MODEL_DIRS[$i]}"
     if [[ -e "$path" ]]; then
         echo "Error: output already exists; choose a new RUN_SUFFIX or remove it deliberately: $path" >&2
         exit 1
@@ -147,18 +188,25 @@ done
 
 echo "Dataset robot type: $DATASET_ROBOT_TYPE"
 echo "Model prefix:       ${MODEL_PREFIX:-<none>}"
+echo "Experiments:        ${SELECTED_EXPERIMENTS[*]}"
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
-    printf 'PRECHECK_ONLY complete; three-model training/evaluation is ready.\n'
-    printf '  %s\n' "${MODEL_DIRS[@]}"
+    printf 'PRECHECK_ONLY complete; selected training/evaluation is ready.\n'
+    for i in "${SELECTED_INDICES[@]}"; do
+        printf '  %s\n' "${MODEL_DIRS[$i]}"
+    done
     exit 0
 fi
+
+printf 'stage\tmodel\tstatus\texit_code\n' > "$EVALUATION_STATUS_FILE"
 
 uv run --no-sync python -m gr00t.data.stats \
     --dataset-path "$TRAIN_DATASET" \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path "${MODALITY_CONFIGS[0]}"
 
-for i in "${!MODALITY_CONFIGS[@]}"; do
+experiment_number=0
+for i in "${SELECTED_INDICES[@]}"; do
+    experiment_number=$((experiment_number + 1))
     MODALITY_CONFIG_PATH="${MODALITY_CONFIGS[$i]}"
     MODEL_DIR="${MODEL_DIRS[$i]}"
     PATCH_EMBED_FLAG="${PATCH_EMBED_FLAGS[$i]}"
@@ -181,7 +229,7 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
     fi
 
     echo "============================================================"
-    echo "Training experiment $((i + 1))/${#MODALITY_CONFIGS[@]}"
+    echo "Training experiment $experiment_number/${#SELECTED_INDICES[@]} (${EXPERIMENT_NAMES[$i]})"
     echo "Dataset:         $TRAIN_DATASET"
     echo "Base model:      $BASE_MODEL_PATH"
     echo "Modality config: $MODALITY_CONFIG_PATH"
@@ -248,7 +296,7 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
     fi
 
     echo "============================================================"
-    echo "Evaluating experiment $((i + 1))/${#MODEL_DIRS[@]}"
+    echo "Evaluating experiment $experiment_number/${#SELECTED_INDICES[@]} (${EXPERIMENT_NAMES[$i]})"
     echo "Model: $MODEL_DIR"
     echo "============================================================"
 

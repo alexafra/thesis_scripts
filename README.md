@@ -40,6 +40,12 @@ validation run:
 ./prepare_inspire_lerobot2.sh train --output /path/to/lerobot2/task
 ```
 
+`multi_finetune_evaluation.sh` runs each selected model as a complete
+train-then-validation-evaluate stage. Its default order is RGB, surface
+normals, then gray depth so the depth stage can be stopped without affecting
+the completed RGB and normals results. Override the ordered subset with, for
+example, `EXPERIMENTS=rgb,normals`.
+
 Passing the original `--source` to either command additionally rechecks exact
 raw-to-split provenance. `all` is the only mode that performs conversion and
 then starts training, and it must be selected explicitly. Every option also has
