@@ -10,9 +10,44 @@ BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 DRY_RUN="${DRY_RUN:-0}"
-RUN_SUFFIX="${RUN_SUFFIX:-three_cups_rightonly_1408_stack_0908_$(date -u +%Y%m%d)}"
+PRECHECK_ONLY="${PRECHECK_ONLY:-0}"
 LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
 mkdir -p "$LOG_ROOT"
+
+TRAIN_INFO="$TRAIN_DATASET/meta/info.json"
+if [[ ! -f "$TRAIN_INFO" ]]; then
+    echo "Error: dataset is not ready: $TRAIN_INFO is missing." >&2
+    exit 1
+fi
+DATASET_ROBOT_TYPE="$(
+    .venv/bin/python -c \
+        'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["robot_type"])' \
+        "$TRAIN_INFO"
+)"
+
+case "$DATASET_ROBOT_TYPE" in
+    Unitree_G1_Inspire_HeadOnly)
+        DEFAULT_MODEL_PREFIX="inspire_"
+        CONFIG_PREFIX="g1_inspire"
+        DEFAULT_RUN_SUFFIX="$(basename "$DATASET_ROOT")_$(date -u +%Y%m%d)"
+        ;;
+    Unitree_G1_Dex3_HeadOnly)
+        DEFAULT_MODEL_PREFIX=""
+        CONFIG_PREFIX="g1_dex3"
+        DEFAULT_RUN_SUFFIX="three_cups_rightonly_1408_stack_0908_$(date -u +%Y%m%d)"
+        ;;
+    *)
+        echo "Error: unsupported dataset robot_type: $DATASET_ROBOT_TYPE" >&2
+        exit 1
+        ;;
+esac
+
+RUN_SUFFIX="${RUN_SUFFIX:-$DEFAULT_RUN_SUFFIX}"
+MODEL_PREFIX="${MODEL_PREFIX:-$DEFAULT_MODEL_PREFIX}"
+if [[ "$PRECHECK_ONLY" != "0" && "$PRECHECK_ONLY" != "1" ]]; then
+    echo "Error: PRECHECK_ONLY must be 0 or 1." >&2
+    exit 1
+fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
     MAX_STEPS=1
@@ -21,9 +56,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
     EVAL_STEPS=8
     EVAL_SELECTION_ARGS=(--traj-ids 0 --train-traj-ids 0 --trajectory-plot-episodes 0)
 elif [[ "$DRY_RUN" == "0" ]]; then
-    MAX_STEPS=30000
+    MAX_STEPS=25000
     SAVE_STEPS=5000
-    RUN_LABEL="30k"
+    RUN_LABEL="25k"
     EVAL_STEPS=0
     EVAL_SELECTION_ARGS=(--train-probe-episodes 3)
 else
@@ -37,15 +72,15 @@ TRAINING_FAILURES=()
 EVALUATION_FAILURES=()
 
 MODALITY_CONFIGS=(
-    "examples/UnitreeG1/g1_dex3_headonly_config.py"
-    "examples/UnitreeG1/g1_dex3_head_4_channel_gray_depth_fusion_config.py"
-    "examples/UnitreeG1/g1_dex3_head_6_channel_surface_normals_fusion_config.py"
+    "examples/UnitreeG1/${CONFIG_PREFIX}_headonly_config.py"
+    "examples/UnitreeG1/${CONFIG_PREFIX}_head_4_channel_gray_depth_fusion_config.py"
+    "examples/UnitreeG1/${CONFIG_PREFIX}_head_6_channel_surface_normals_fusion_config.py"
 )
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_rgb_patch_tuned_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/${MODEL_PREFIX}c_rgb_patch_tuned_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/${MODEL_PREFIX}c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$HOME/Development/Models/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
 )
 
 PATCH_EMBED_FLAGS=(
@@ -85,6 +120,15 @@ for dataset in "$TRAIN_DATASET" "$VALIDATION_DATASET"; do
             exit 1
         fi
     done
+    dataset_robot_type="$(
+        .venv/bin/python -c \
+            'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["robot_type"])' \
+            "$dataset/meta/info.json"
+    )"
+    if [[ "$dataset_robot_type" != "$DATASET_ROBOT_TYPE" ]]; then
+        echo "Error: train/validation robot_type mismatch: $dataset_robot_type" >&2
+        exit 1
+    fi
 done
 
 for path in "${MODALITY_CONFIGS[@]}"; do
@@ -100,6 +144,14 @@ for path in "${MODEL_DIRS[@]}"; do
         exit 1
     fi
 done
+
+echo "Dataset robot type: $DATASET_ROBOT_TYPE"
+echo "Model prefix:       ${MODEL_PREFIX:-<none>}"
+if [[ "$PRECHECK_ONLY" == "1" ]]; then
+    printf 'PRECHECK_ONLY complete; three-model training/evaluation is ready.\n'
+    printf '  %s\n' "${MODEL_DIRS[@]}"
+    exit 0
+fi
 
 uv run --no-sync python -m gr00t.data.stats \
     --dataset-path "$TRAIN_DATASET" \

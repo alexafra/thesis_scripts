@@ -69,6 +69,8 @@ def make_dataset(
     *,
     aligned_scale: float = 0.001,
     aligned_total_files: int = 2,
+    end_effector: dict | None = None,
+    surface_normals_encoding: dict | None = None,
 ) -> None:
     length = 2
     info = {
@@ -126,6 +128,10 @@ def make_dataset(
             "total_files": aligned_total_files,
         },
     }
+    if end_effector is not None:
+        info["end_effector"] = end_effector
+    if surface_normals_encoding is not None:
+        info["surface_normals_encoding"] = surface_normals_encoding
     write_json(root / "meta" / "info.json", info)
     write_json(root / "meta" / "modality.json", {"video": {"ego_view": {}}})
     write_jsonl(root / "meta" / "tasks.jsonl", [{"task_index": 0, "task": "test task"}])
@@ -177,6 +183,32 @@ def make_dataset(
         aligned = sidecar_path(root, ALIGNED_DEPTH_TEMPLATE, 0, frame_index)
         aligned.parent.mkdir(parents=True, exist_ok=True)
         aligned.write_bytes(b"aligned-" + marker + bytes([frame_index]))
+
+
+def make_split_manifest(root: Path, marker: str) -> None:
+    records = []
+    for split in ("train", "test", "validation"):
+        records.append(
+            {
+                "split": split,
+                "split_episode": "episode_0001",
+                "flattened_episode": f"episode_{marker}_{split}",
+                "source_episode": f"episode_{marker}_{split}",
+                "source_session": marker,
+                "goal": "test task",
+                "frame_count": 2,
+                "data_json_sha256": hashlib.sha256(f"{marker}:{split}".encode()).hexdigest(),
+            }
+        )
+    write_json(
+        root / "split_manifest.json",
+        {
+            "version": 1,
+            "strategy": "goal-stratified",
+            "episode_count": len(records),
+            "episodes": records,
+        },
+    )
 
 
 def add_canonical_lz4_normals(root: Path, marker: bytes) -> None:
@@ -325,6 +357,78 @@ class AppendLerobot2AlignedDepthTest(unittest.TestCase):
             self.assertEqual(tree_digest(first), first_digest)
             self.assertEqual(tree_digest(second), second_digest)
 
+    def test_one_call_merges_all_splits_and_updates_provenance(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            first = temporary / "first"
+            second = temporary / "second"
+            destination = temporary / "combined"
+            for root, marker in ((first, "first"), (second, "second")):
+                for split in ("train", "test", "validation"):
+                    make_dataset(root / split, f"{marker}-{split}".encode())
+                make_split_manifest(root, marker)
+
+            self.run_append(destination, first)
+            result = self.run_append(destination, second)
+
+            self.assertIn("copied 3 episode(s) and 6 frame(s)", result.stdout)
+            for split in ("train", "test", "validation"):
+                info = json.loads((destination / split / "meta" / "info.json").read_text())
+                self.assertEqual(info["total_episodes"], 2)
+                self.assertEqual(info["total_frames"], 4)
+
+            combined = json.loads((destination / "split_manifest.json").read_text())
+            merge = json.loads(
+                (destination / "provenance" / "merge_manifest.json").read_text()
+            )
+            self.assertEqual(combined["strategy"], "component-append")
+            self.assertEqual(combined["episode_count"], 6)
+            self.assertEqual(combined["episodes"], merge["episodes"])
+            self.assertEqual(len({item["data_json_sha256"] for item in merge["episodes"]}), 6)
+            for split in ("train", "test", "validation"):
+                records = [item for item in merge["episodes"] if item["split"] == split]
+                self.assertEqual([item["final_episode_index"] for item in records], [0, 1])
+                self.assertEqual(
+                    [item["split_episode"] for item in records],
+                    ["episode_000000", "episode_000001"],
+                )
+                self.assertEqual([item["source"] for item in records], ["first", "second"])
+
+    def test_untracked_payload_collision_does_not_modify_destination(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(destination, b"destination")
+            make_dataset(source, b"source")
+            stale = destination / "data" / "chunk-001" / "episode_000001.parquet"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"untracked-payload")
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Refusing to overwrite unexpected existing payload", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
+    def test_duplicate_source_hashes_are_rejected_transactionally(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            source = temporary / "source"
+            destination = temporary / "destination"
+            for split in ("train", "test", "validation"):
+                make_dataset(source / split, split.encode())
+            make_split_manifest(source, "source")
+            self.run_append(destination, source)
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Duplicate source episode hash", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
     def test_split_sources_copy_and_reindex_canonical_lz4_normals(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
             temporary = Path(temporary_dir)
@@ -380,6 +484,78 @@ class AppendLerobot2AlignedDepthTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("different aligned_depth_encoding", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
+    def test_inspire_transport_metadata_must_be_compatible(self):
+        ftp = {
+            "type": "inspire",
+            "protocol": "ftp",
+            "hand_dof": 6,
+            "value_semantics": "normalized_open_fraction",
+        }
+        dfx = {**ftp, "protocol": "dfx"}
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(destination, b"destination", end_effector=ftp)
+            make_dataset(source, b"source", end_effector=dfx)
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("different end_effector", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
+    def test_matching_inspire_ftp_metadata_can_be_appended(self):
+        ftp = {
+            "type": "inspire",
+            "protocol": "ftp",
+            "hand_dof": 6,
+            "value_semantics": "normalized_open_fraction",
+        }
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(destination, b"destination", end_effector=ftp)
+            make_dataset(source, b"source", end_effector=ftp)
+
+            result = self.run_append(destination, source)
+
+            self.assertIn("copied 1 episode(s) and 2 frame(s)", result.stdout)
+            info = json.loads((destination / "meta" / "info.json").read_text())
+            self.assertEqual(info["total_episodes"], 2)
+            self.assertEqual(info["end_effector"], ftp)
+
+    def test_surface_normals_encoding_must_be_compatible(self):
+        first_encoding = {
+            "method": "camera_space_cross_product",
+            "depth_near_m": 0.25,
+            "depth_far_m": 1.0,
+        }
+        second_encoding = {**first_encoding, "depth_far_m": 1.2}
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(
+                destination,
+                b"destination",
+                surface_normals_encoding=first_encoding,
+            )
+            make_dataset(
+                source,
+                b"source",
+                surface_normals_encoding=second_encoding,
+            )
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("different surface_normals_encoding", result.stderr)
             self.assertEqual(tree_digest(destination), destination_digest)
 
     def test_aligned_depth_count_and_missing_files_are_validated(self):

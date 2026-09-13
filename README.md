@@ -1,5 +1,57 @@
 # Thesis scripts
 
+## General Inspire dataset pipeline
+
+`prepare_inspire_lerobot2.sh` is the reusable coordinator for one complete,
+already-curated `processed_raw` dataset. It stages every direct `episode_*`,
+creates deterministic train/validation/test splits with `split_dataset.py`, and
+uses `convert_to_lerobot2.sh` for the full RGB, gray-depth, lossless-depth, and
+surface-normal LeRobot v2.1 conversion. It never changes the raw source and has
+no episode filtering or exclusion behavior.
+
+No mode is implicit. Preflight a raw dataset without writing anything:
+
+```bash
+./prepare_inspire_lerobot2.sh check \
+  --source /path/to/processed_raw/task
+```
+
+Convert and publish one dataset:
+
+```bash
+./prepare_inspire_lerobot2.sh convert \
+  --source /path/to/processed_raw/task \
+  --output /path/to/lerobot2/task \
+  --repo-id task \
+  --split-strategy goal-stratified \
+  --split-seed 42
+```
+
+The current 137-episode red-cup source therefore targets 109 train, 14
+validation, and 14 test episodes. The pipeline verifies the exact raw episode
+names and `data.json` hashes before publishing, as well as the 26D Inspire and
+RGB/depth/normals contract in all three converted splits.
+
+Check training readiness or deliberately start the three-model training and
+validation run:
+
+```bash
+./prepare_inspire_lerobot2.sh training-check --output /path/to/lerobot2/task
+./prepare_inspire_lerobot2.sh train --output /path/to/lerobot2/task
+```
+
+Passing the original `--source` to either command additionally rechecks exact
+raw-to-split provenance. `all` is the only mode that performs conversion and
+then starts training, and it must be selected explicitly. Every option also has
+an uppercase environment equivalent, such as `SOURCE_ROOT`, `DATASET_ROOT`,
+`REPO_ID`, `SPLIT_STRATEGY`, and `SPLIT_SEED`.
+
+There is no merge step when converting a single processed-raw population. To
+append an independently converted Inspire FTP component to an existing LeRobot
+root, use `append_lerobot2.py`; that transaction updates train,
+validation, and test together. It remains separate from conversion/training so
+an append cannot start a training run implicitly.
+
 ## Geometry-only GR00T ablations
 
 `geometry_only_finetune_evaluation.sh` trains and evaluates one visual ablation at a

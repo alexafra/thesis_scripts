@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -124,6 +125,9 @@ def load_episodes(root: Path, source_records: dict[str, dict]) -> list[dict]:
         goal = text_info.get("goal", "") if isinstance(text_info, dict) else ""
         if not isinstance(goal, str):
             goal = str(goal)
+        frames = episode_json.get("data")
+        if not isinstance(frames, list):
+            raise ValueError(f"Episode data is not a list: {json_path}")
 
         source = source_records.get(episode_path.name, {})
         session = source.get("source_session")
@@ -137,6 +141,8 @@ def load_episodes(root: Path, source_records: dict[str, dict]) -> list[dict]:
                 "source_episode": source.get("source_episode", episode_path.name),
                 "source_session": session,
                 "goal": goal.strip(),
+                "frame_count": len(frames),
+                "data_json_sha256": hashlib.sha256(json_path.read_bytes()).hexdigest(),
             }
         )
 
@@ -307,6 +313,8 @@ def apply_split(root: Path, splits: dict[str, list[dict]], strategy: str, seed: 
                     "source_episode": episode["source_episode"],
                     "source_session": episode["source_session"],
                     "goal": episode["goal"],
+                    "frame_count": episode["frame_count"],
+                    "data_json_sha256": episode["data_json_sha256"],
                     "source_path": episode["path"],
                 }
             )

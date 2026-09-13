@@ -8,6 +8,8 @@ Examples (run from /home/alex/Development/scripts/):
 
 The same command also accepts roots containing any subset of train/, test/, and
 validation/ (or validate/). Matching splits are merged independently.
+For split roots, source manifests are combined into split_manifest.json and
+provenance/merge_manifest.json with final episode and frame-index ranges.
 
 The destination is replaced transactionally. Sources are always copied and are
 never modified. Existing destination Parquet, video, raw-depth, and aligned-depth
@@ -21,12 +23,13 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
-import uuid
-from pathlib import Path
 from typing import Any
+import uuid
 
 import numpy as np
 import pyarrow as pa
@@ -38,6 +41,8 @@ SPLIT_NAMES = ("train", "test", "validation")
 VALIDATION_ALIASES = ("validation", "validate")
 SPECIAL_STATS = ("episode_index", "index", "task_index")
 SURFACE_NORMALS_LZ4_KEY = "surface_normals_lz4"
+EPISODE_NAME = re.compile(r"^episode_(\d+)$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class MergeError(RuntimeError):
@@ -118,6 +123,11 @@ def copy_source_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=shutil.copy2, symlinks=True, dirs_exist_ok=True)
 
 
+def require_new_path(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise MergeError(f"Refusing to overwrite unexpected existing payload: {path}")
+
+
 def is_dataset(path: Path) -> bool:
     return (path / "meta" / "info.json").is_file()
 
@@ -126,9 +136,15 @@ def split_dirs(root: Path) -> dict[str, Path]:
     found: dict[str, Path] = {}
     for name in ("train", "test"):
         candidate = root / name
+        if candidate.is_symlink():
+            raise MergeError(f"Dataset split may not be a symlink: {candidate}")
         if is_dataset(candidate):
             found[name] = candidate
-    validation = [root / name for name in VALIDATION_ALIASES if is_dataset(root / name)]
+    validation_candidates = [root / name for name in VALIDATION_ALIASES]
+    symlink = next((path for path in validation_candidates if path.is_symlink()), None)
+    if symlink is not None:
+        raise MergeError(f"Dataset split may not be a symlink: {symlink}")
+    validation = [path for path in validation_candidates if is_dataset(path)]
     if len(validation) > 1:
         raise MergeError(f"{root} contains both validation/ and validate/; keep only one")
     if validation:
@@ -160,7 +176,7 @@ def episode_path(root: Path, info: dict[str, Any], episode_index: int) -> Path:
         episode_chunk=episode_index // chunks_size,
         episode_index=episode_index,
     )
-    return root / relative
+    return _internal_dataset_path(root, relative, "data_path")
 
 
 def video_path(root: Path, info: dict[str, Any], episode_index: int, video_key: str) -> Path:
@@ -170,7 +186,7 @@ def video_path(root: Path, info: dict[str, Any], episode_index: int, video_key: 
         episode_index=episode_index,
         video_key=video_key,
     )
-    return root / relative
+    return _internal_dataset_path(root, relative, "video_path")
 
 
 def video_keys(info: dict[str, Any]) -> list[str]:
@@ -408,6 +424,8 @@ def aligned_depth_path(
 
 def load_metadata(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     meta = root / "meta"
+    if meta.is_symlink():
+        raise MergeError(f"Dataset metadata directory may not be a symlink: {meta}")
     missing = [name for name in META_FILES if not (meta / name).is_file()]
     if missing:
         raise MergeError(f"{root} is missing metadata: {', '.join(missing)}")
@@ -540,7 +558,14 @@ def compatibility_value(root: Path, filename: str) -> Any:
 
 
 def check_compatible(destination: Path, source: Path, destination_info: dict[str, Any], source_info: dict[str, Any]) -> None:
-    fields = ("robot_type", "fps", "features", "depth_encoding")
+    fields = (
+        "robot_type",
+        "fps",
+        "features",
+        "depth_encoding",
+        "end_effector",
+        "surface_normals_encoding",
+    )
     differences = [field for field in fields if destination_info.get(field) != source_info.get(field)]
     destination_raw = raw_depth_encoding(destination_info)
     source_raw = raw_depth_encoding(source_info)
@@ -663,8 +688,7 @@ def copy_reindexed_lz4_episode(
     destination_episode = (
         lz4_storage_root(destination, destination_info) / f"episode_{new_episode_index:06d}"
     )
-    if destination_episode.exists():
-        raise MergeError(f"Destination LZ4 episode already exists: {destination_episode}")
+    require_new_path(destination_episode)
     destination_episode.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source_episode, destination_episode, copy_function=shutil.copy2)
     index_path = destination_episode / "index.json"
@@ -676,6 +700,7 @@ def copy_reindexed_lz4_episode(
     destination_backup = (
         lz4_backup_root(destination, destination_info) / f"episode_{new_episode_index:06d}.mp4"
     )
+    require_new_path(destination_backup)
     destination_backup.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_backup, destination_backup)
     validate_lz4_episode(destination, destination_info, new_episode_index, length)
@@ -762,6 +787,7 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
         table = replace_column(table, "task_index", new_task_values)
 
         destination_parquet = episode_path(destination, destination_info, new_episode_index)
+        require_new_path(destination_parquet)
         destination_parquet.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, destination_parquet, compression="snappy")
         destination_lz4 = surface_normals_lz4(destination_info)
@@ -782,6 +808,7 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                 continue
             source_video = video_path(source, source_info, old_episode_index, key)
             destination_video = video_path(destination, destination_info, new_episode_index, key)
+            require_new_path(destination_video)
             destination_video.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_video, destination_video)
         if raw_depth_encoding(destination_info) is not None:
@@ -798,6 +825,7 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                     new_episode_index,
                     frame_index,
                 )
+                require_new_path(destination_raw_depth)
                 destination_raw_depth.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_raw_depth, destination_raw_depth)
         if aligned_depth_encoding(destination_info) is not None:
@@ -814,6 +842,7 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                     new_episode_index,
                     frame_index,
                 )
+                require_new_path(destination_aligned_depth)
                 destination_aligned_depth.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_aligned_depth, destination_aligned_depth)
 
@@ -881,6 +910,146 @@ def merge_direct_in_stage(stage: Path, sources: list[Path]) -> tuple[int, int]:
     return added_episodes, added_frames
 
 
+def split_provenance_records(
+    root: Path,
+    episode_offsets: dict[str, int],
+    frame_offsets: dict[str, int],
+    source_label: str,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int]]:
+    """Map optional raw/merged provenance onto this root's converted episode order."""
+
+    lengths = {
+        split: [int(record["length"]) for record in read_jsonl(path / "meta" / "episodes.jsonl")]
+        for split, path in split_dirs(root).items()
+    }
+    manifest_path = root / "provenance" / "merge_manifest.json"
+    if not manifest_path.is_file():
+        manifest_path = root / "split_manifest.json"
+    split_manifest_supplied = manifest_path.name == "split_manifest.json" and manifest_path.is_file()
+    supplied: list[dict[str, Any]] = []
+    if manifest_path.is_file():
+        manifest = read_json(manifest_path)
+        supplied = manifest.get("episodes", []) if isinstance(manifest, dict) else []
+        if not isinstance(supplied, list) or any(not isinstance(item, dict) for item in supplied):
+            raise MergeError(f"Invalid episode provenance in {manifest_path}")
+        invalid_splits = {
+            item.get("split") for item in supplied if item.get("split") not in {*SPLIT_NAMES, "validate"}
+        }
+        if invalid_splits:
+            raise MergeError(f"Invalid splits in {manifest_path}: {sorted(map(str, invalid_splits))}")
+
+    result: list[dict[str, Any]] = []
+    episode_counts: dict[str, int] = {}
+    frame_counts: dict[str, int] = {}
+    for split, split_lengths in lengths.items():
+        candidates = [
+            item
+            for item in supplied
+            if ("validation" if item.get("split") == "validate" else item.get("split")) == split
+        ]
+        if split_manifest_supplied and len(candidates) != len(split_lengths):
+            raise MergeError(f"{manifest_path} does not cover every {split} episode")
+        indexed: dict[int, dict[str, Any]] = {}
+        if candidates and all(isinstance(item.get("final_episode_index"), int) for item in candidates):
+            indexed = {int(item["final_episode_index"]): item for item in candidates}
+            if len(indexed) != len(candidates):
+                raise MergeError(f"Duplicate final episode provenance in {manifest_path}")
+        elif candidates:
+            ordered: list[tuple[int, dict[str, Any]]] = []
+            for item in candidates:
+                match = EPISODE_NAME.fullmatch(str(item.get("split_episode", "")))
+                if match is None:
+                    raise MergeError(f"Invalid split_episode provenance in {manifest_path}")
+                ordered.append((int(match.group(1)), item))
+            if len({number for number, _ in ordered}) != len(ordered):
+                raise MergeError(f"Duplicate split_episode provenance in {manifest_path}")
+            indexed = {
+                index: item for index, (_, item) in enumerate(sorted(ordered, key=lambda pair: pair[0]))
+            }
+        if any(index < 0 or index >= len(split_lengths) for index in indexed):
+            raise MergeError(f"Episode provenance is out of range in {manifest_path}")
+
+        next_frame = frame_offsets[split]
+        for local_index, length in enumerate(split_lengths):
+            item = dict(indexed.get(local_index, {}))
+            if "frame_count" in item and int(item["frame_count"]) != length:
+                raise MergeError(f"Episode provenance length mismatch in {manifest_path}")
+            old_name = item.get("split_episode")
+            item.setdefault("source", source_label)
+            item.setdefault("source_episode_index", local_index)
+            item.setdefault(
+                "source_split_episode",
+                old_name if isinstance(old_name, str) else f"episode_{local_index:06d}",
+            )
+            final_index = episode_offsets[split] + local_index
+            item.update(
+                {
+                    "split": split,
+                    "split_episode": f"episode_{final_index:06d}",
+                    "final_episode_index": final_index,
+                    "final_index_start": next_frame,
+                    "final_index_end_exclusive": next_frame + length,
+                    "frame_count": length,
+                }
+            )
+            result.append(item)
+            next_frame += length
+        episode_counts[split] = len(split_lengths)
+        frame_counts[split] = sum(split_lengths)
+    return result, episode_counts, frame_counts
+
+
+def validate_split_root_contract(root: Path) -> None:
+    splits = list(split_dirs(root).values())
+    if len(splits) < 2:
+        return
+    reference = splits[0]
+    reference_info = read_json(reference / "meta" / "info.json")
+    for split in splits[1:]:
+        check_compatible(reference, split, reference_info, read_json(split / "meta" / "info.json"))
+
+
+def write_split_provenance(stage: Path, records: list[dict[str, Any]]) -> None:
+    seen_hashes: set[str] = set()
+    for record in records:
+        digest = record.get("data_json_sha256")
+        if digest is None:
+            continue
+        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+            raise MergeError(f"Invalid data_json_sha256 in split provenance: {digest!r}")
+        if digest in seen_hashes:
+            raise MergeError(f"Duplicate source episode hash in split provenance: {digest}")
+        seen_hashes.add(digest)
+
+    split_summary = {}
+    for split, path in split_dirs(stage).items():
+        info = read_json(path / "meta" / "info.json")
+        split_summary[split] = {
+            "episodes": int(info["total_episodes"]),
+            "frames": int(info["total_frames"]),
+        }
+    if len(records) != sum(item["episodes"] for item in split_summary.values()):
+        raise MergeError("Combined provenance does not cover every destination episode")
+    manifest = {
+        "version": 1,
+        "generator": "append_lerobot2.py",
+        "splits": split_summary,
+        "episodes": records,
+    }
+    if (stage / "provenance").is_symlink():
+        raise MergeError(f"Provenance directory may not be a symlink: {stage / 'provenance'}")
+    atomic_write_json(stage / "provenance" / "merge_manifest.json", manifest)
+    atomic_write_json(
+        stage / "split_manifest.json",
+        {
+            "version": 1,
+            "strategy": "component-append",
+            "episode_count": len(records),
+            "episodes": records,
+        },
+    )
+
+
 def destination_split_path(root: Path, logical_name: str) -> Path:
     if logical_name != "validation":
         return root / logical_name
@@ -892,6 +1061,22 @@ def destination_split_path(root: Path, logical_name: str) -> Path:
 
 
 def merge_split_root_in_stage(stage: Path, sources: list[Path]) -> tuple[int, int]:
+    provenance: list[dict[str, Any]] = []
+    episode_offsets = {split: 0 for split in SPLIT_NAMES}
+    frame_offsets = {split: 0 for split in SPLIT_NAMES}
+    provenance_roots = ([(stage, "existing")] if split_dirs(stage) else []) + [
+        (source, source.name) for source in sources
+    ]
+    for root, label in provenance_roots:
+        validate_split_root_contract(root)
+        records, episode_counts, frame_counts = split_provenance_records(
+            root, episode_offsets, frame_offsets, label
+        )
+        provenance.extend(records)
+        for split in SPLIT_NAMES:
+            episode_offsets[split] += episode_counts.get(split, 0)
+            frame_offsets[split] += frame_counts.get(split, 0)
+
     total_episodes = 0
     total_frames = 0
     for logical_name in SPLIT_NAMES:
@@ -904,6 +1089,7 @@ def merge_split_root_in_stage(stage: Path, sources: list[Path]) -> tuple[int, in
         total_frames += frames
     if not split_dirs(stage):
         raise MergeError("No train, test, or validation datasets were supplied")
+    write_split_provenance(stage, provenance)
     return total_episodes, total_frames
 
 

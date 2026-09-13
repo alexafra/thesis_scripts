@@ -3,19 +3,45 @@ set -uo pipefail
 
 cd "$HOME/Development/Isaac-GR00T"
 
-TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train"
-VALIDATION_DATASET="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/validation"
+TRAIN_DATASET="${TRAIN_DATASET:-/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/train}"
+VALIDATION_DATASET="${VALIDATION_DATASET:-/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08/validation}"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 RUN_SUFFIX="${RUN_SUFFIX:-1808_1_missed_normals}"
-STATUS_FILE="${EVALUATION_STATUS_FILE:-$HOME/Development/partial_multi_finetune_evaluation_${RUN_SUFFIX}_evaluation_status.tsv}"
+LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
+mkdir -p "$LOG_ROOT"
+STATUS_FILE="${EVALUATION_STATUS_FILE:-$LOG_ROOT/partial_multi_finetune_evaluation_${RUN_SUFFIX}_evaluation_status.tsv}"
+
+TRAIN_INFO="$TRAIN_DATASET/meta/info.json"
+if [[ ! -f "$TRAIN_INFO" ]]; then
+    echo "Error: dataset is not ready: $TRAIN_INFO is missing." >&2
+    exit 1
+fi
+DATASET_ROBOT_TYPE="$(
+    .venv/bin/python -c \
+        'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["robot_type"])' \
+        "$TRAIN_INFO"
+)"
+case "$DATASET_ROBOT_TYPE" in
+    Unitree_G1_Inspire_HeadOnly) DEFAULT_MODEL_PREFIX="inspire_" ;;
+    Unitree_G1_Dex3_HeadOnly) DEFAULT_MODEL_PREFIX="" ;;
+    *)
+        echo "Error: unsupported dataset robot_type: $DATASET_ROBOT_TYPE" >&2
+        exit 1
+        ;;
+esac
+MODEL_PREFIX="${MODEL_PREFIX:-$DEFAULT_MODEL_PREFIX}"
+[[ "$MODEL_PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] || {
+    echo "Error: invalid MODEL_PREFIX: $MODEL_PREFIX" >&2
+    exit 1
+}
 
 # Both models completed training in the main 1808_1 pipeline. Their first
 # evaluations stopped before inference because the policy contract rejected
 # the supported six-channel rgb_mean initialization.
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_fp32_batch_8_acc_4_20k_1808_1"
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_20k_1808_1"
+    "$HOME/Development/Models/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_fp32_batch_8_acc_4_20k_1808_1"
+    "$HOME/Development/Models/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_20k_1808_1"
 )
 
 printf 'stage\tmodel\tstatus\texit_code\n' > "$STATUS_FILE"
