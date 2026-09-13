@@ -16,6 +16,18 @@ EXPERIMENTS="${EXPERIMENTS:-rgb,normals,depth}"
 LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
 mkdir -p "$LOG_ROOT"
 
+# The base checkpoint refers to its Cosmos processor by Hugging Face repo ID.
+# Use the already-qualified local cache so an overnight run never depends on
+# network access or an interactive gated-repository login.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export GROOT_HF_LOCAL_FIRST=1
+export GROOT_PATCH_MISTRAL=1
+unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+
 TRAIN_INFO="$TRAIN_DATASET/meta/info.json"
 if [[ ! -f "$TRAIN_INFO" ]]; then
     echo "Error: dataset is not ready: $TRAIN_INFO is missing." >&2
@@ -185,6 +197,32 @@ for i in "${SELECTED_INDICES[@]}"; do
         exit 1
     fi
 done
+
+.venv/bin/python - "$BASE_MODEL_PATH" <<'PY'
+from pathlib import Path
+import sys
+
+from huggingface_hub import snapshot_download
+
+base = Path(sys.argv[1])
+required_base = (
+    "config.json",
+    "processor_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+)
+missing = [name for name in required_base if not (base / name).is_file()]
+if missing:
+    raise SystemExit(f"Error: local GR00T base is incomplete: {missing}")
+
+snapshot = Path(snapshot_download("nvidia/Cosmos-Reason2-2B", local_files_only=True))
+required_backbone = ("config.json", "model.safetensors", "tokenizer.json", "preprocessor_config.json")
+missing = [name for name in required_backbone if not (snapshot / name).is_file()]
+if missing:
+    raise SystemExit(f"Error: local Cosmos cache is incomplete: {missing}")
+print(f"Local-only Cosmos cache: {snapshot}")
+PY
 
 echo "Dataset robot type: $DATASET_ROBOT_TYPE"
 echo "Model prefix:       ${MODEL_PREFIX:-<none>}"
