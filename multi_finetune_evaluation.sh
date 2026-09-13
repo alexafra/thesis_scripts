@@ -10,7 +10,7 @@ BASE_MODEL_PATH="$HOME/Development/Models/GR00T-N1.7-3B"
 EXECUTION_HORIZON=8
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-8}"
 DRY_RUN="${DRY_RUN:-0}"
-RUN_SUFFIX="${RUN_SUFFIX:-three_cups_rightonly_1408_stack_0908_$(date +%Y-%m-%dT%H%M%S%z)}"
+RUN_SUFFIX="${RUN_SUFFIX:-three_cups_rightonly_1408_stack_0908_$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_ROOT="${LOG_ROOT:-$HOME/Development/logs/groot/training}"
 mkdir -p "$LOG_ROOT"
 

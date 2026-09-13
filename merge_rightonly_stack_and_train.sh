@@ -17,7 +17,7 @@ STACK_SOURCE="/home/alex/Development/Datasets/processed_raw/stack_cups_09_08"
 TARGET_DATASET="$DATASETS_DIR/atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08"
 BASE_MODEL="/home/alex/Development/Models/GR00T-N1.7-3B"
 
-RUN_ID="${RUN_ID:-$(date +%Y-%m-%dT%H%M%S%z)}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 WORK_ROOT="$DATASETS_DIR/.three_cups_merge_work_${RUN_ID}"
 BUILD_DATASET="$DATASETS_DIR/.atomic_combined_rightonly_stack.build-${RUN_ID}"
 RIGHT_STAGE="$WORK_ROOT/pick_three_cups_right_only_1408"
