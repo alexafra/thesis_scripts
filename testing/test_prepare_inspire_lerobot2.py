@@ -17,7 +17,7 @@ def _write_executable(path: Path, text: str) -> None:
 
 
 def _make_raw(root: Path, episode_count: int) -> None:
-    root.mkdir()
+    root.mkdir(parents=True)
     for episode_index in range(1, episode_count + 1):
         episode = root / f"episode_{episode_index:04d}"
         episode.mkdir()
@@ -161,6 +161,20 @@ def _run(
     )
 
 
+def _run_dataset_name(
+    mode: str,
+    dataset_name: str,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(PIPELINE), mode, "--dataset-name", dataset_name],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_no_mode_does_not_run_any_stage(tmp_path: Path) -> None:
     environment = _fake_environment(tmp_path)
 
@@ -205,6 +219,147 @@ def test_convert_includes_all_137_episodes_and_builds_three_splits(tmp_path: Pat
     assert all("--end-effector inspire-ftp" in call for call in calls)
     assert all("--camera-calibration-profile d435i-254322071415" in call for call in calls)
     assert all("near=0.25 far=1.0 profile=d435i-254322071415" in call for call in calls)
+    assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_convert_accepts_canonical_inspire_stage_hierarchy(tmp_path: Path) -> None:
+    environment = _fake_environment(tmp_path)
+    datasets = tmp_path / "Datasets"
+    task_name = "pick_place_red_cup_08_13"
+    raw = datasets / "raw" / "inspire" / task_name
+    source = datasets / "processed_raw" / "inspire" / task_name
+    output = datasets / "lerobot2" / "inspire" / task_name
+
+    raw.mkdir(parents=True)
+    raw_sentinel = raw / "collection_is_not_pipeline_input.txt"
+    raw_sentinel.write_text("raw remains untouched", encoding="utf-8")
+    _make_raw(source, 10)
+
+    result = _run("convert", source, output, environment)
+
+    assert f"Published validated dataset: {output}" in result.stdout
+    assert output.is_dir()
+    assert (output / "train" / "meta" / "info.json").is_file()
+    assert (output / "validation" / "meta" / "info.json").is_file()
+    assert (output / "test" / "meta" / "info.json").is_file()
+    assert len(list(source.glob("episode_*"))) == 10
+    assert raw_sentinel.read_text(encoding="utf-8") == "raw remains untouched"
+    assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_dataset_name_derives_canonical_inspire_source_and_output(
+    tmp_path: Path,
+) -> None:
+    environment = _fake_environment(tmp_path)
+    datasets = tmp_path / "Datasets"
+    environment["DATASETS_ROOT"] = str(datasets)
+    task_name = "pick_place_red_cup_08_13"
+    source = datasets / "processed_raw" / "inspire" / task_name
+    output = datasets / "lerobot2" / "inspire" / task_name
+    _make_raw(source, 10)
+
+    result = _run_dataset_name("convert", task_name, environment)
+
+    assert f"Published validated dataset: {output}" in result.stdout
+    assert output.is_dir()
+    assert len(list(source.glob("episode_*"))) == 10
+    assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_dataset_name_environment_derives_paths(tmp_path: Path) -> None:
+    environment = _fake_environment(tmp_path)
+    datasets = tmp_path / "Datasets"
+    task_name = "pick_place_red_cup_08_13"
+    source = datasets / "processed_raw" / "inspire" / task_name
+    _make_raw(source, 3)
+    environment.update(
+        {
+            "DATASETS_ROOT": str(datasets),
+            "DATASET_NAME": task_name,
+        }
+    )
+
+    result = subprocess.run(
+        [str(PIPELINE), "check"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Raw population: 3 episodes; all will be included." in result.stdout
+
+
+def test_explicit_paths_override_dataset_name_derived_paths(tmp_path: Path) -> None:
+    environment = _fake_environment(tmp_path)
+    environment["DATASETS_ROOT"] = str(tmp_path / "unused_Datasets")
+    source = tmp_path / "explicit_source"
+    output = tmp_path / "explicit_output"
+    _make_raw(source, 10)
+
+    result = subprocess.run(
+        [
+            str(PIPELINE),
+            "convert",
+            "--dataset-name",
+            "derived_name_must_not_win",
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Published validated dataset: {output}" in result.stdout
+    assert not (tmp_path / "unused_Datasets" / "lerobot2").exists()
+
+
+def test_dataset_name_must_be_one_safe_path_component(tmp_path: Path) -> None:
+    for index, unsafe_name in enumerate(("../escape", "nested/task", ".", "..")):
+        case_root = tmp_path / f"case_{index}"
+        case_root.mkdir()
+        environment = _fake_environment(case_root)
+        environment["DATASETS_ROOT"] = str(tmp_path / "Datasets")
+        result = subprocess.run(
+            [str(PIPELINE), "check", "--dataset-name", unsafe_name],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "dataset-name" in result.stderr.lower()
+        assert not Path(environment["CONVERT_LOG"]).exists()
+        assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_check_rejects_embodiment_container_instead_of_combining_tasks(
+    tmp_path: Path,
+) -> None:
+    environment = _fake_environment(tmp_path)
+    inspire_root = tmp_path / "Datasets" / "processed_raw" / "inspire"
+    inspire_root.mkdir(parents=True)
+    _make_raw(inspire_root / "first_task", 3)
+    _make_raw(inspire_root / "second_task", 3)
+
+    result = subprocess.run(
+        [str(PIPELINE), "check", "--source", str(inspire_root)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert f"No direct episode_* directories found in {inspire_root}" in result.stderr
+    assert not Path(environment["CONVERT_LOG"]).exists()
     assert not Path(environment["TRAIN_LOG"]).exists()
 
 

@@ -8,6 +8,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ISAAC_GROOT_REPO="${ISAAC_GROOT_REPO:-/home/alex/Development/Isaac-GR00T}"
 GROOT_PYTHON="${GROOT_PYTHON:-$ISAAC_GROOT_REPO/.venv/bin/python}"
+DATASETS_ROOT="${DATASETS_ROOT:-/home/alex/Development/Datasets}"
+DATASET_NAME="${DATASET_NAME:-}"
 SOURCE_ROOT="${SOURCE_ROOT:-}"
 DATASET_ROOT="${DATASET_ROOT:-}"
 REPO_ID="${REPO_ID:-}"
@@ -34,7 +36,7 @@ Build one complete Inspire LeRobot dataset from every episode in a curated
 processed_raw directory. MODE is required; no mode starts training implicitly.
 
 Modes:
-  check           Preflight every raw episode; do not copy or convert anything.
+  check           Preflight every processed episode; do not copy or convert anything.
   convert         Copy every episode, split train/validation/test, convert, validate,
                   and publish the completed dataset.
   training-check  Validate the published split population and run the non-training
@@ -45,6 +47,11 @@ Modes:
 Options (the matching uppercase environment variable may be used instead):
   --source PATH             Curated processed_raw root (SOURCE_ROOT).
   --output PATH             Final LeRobot split root (DATASET_ROOT).
+  --datasets-root PATH      Parent containing raw/, processed_raw/, and lerobot2/
+                            (default: /home/alex/Development/Datasets).
+  --dataset-name NAME       Resolve omitted paths as:
+                              processed_raw/inspire/NAME
+                              lerobot2/inspire/NAME
   --repo-id ID              Base local LeRobot repo ID; defaults to output basename.
   --end-effector TYPE       inspire-ftp (default) or inspire-dfx.
   --split-strategy NAME     goal-stratified (default) or session-grouped.
@@ -68,8 +75,11 @@ lossless depth, and surface normals.
 
 Example:
   prepare_inspire_lerobot2.sh convert \
-    --source /data/processed_raw/pick_red_cup \
-    --output /data/lerobot2/pick_red_cup
+    --dataset-name pick_red_cup
+
+Explicit --source and --output remain available for staging or nonstandard
+locations. This coordinator begins at processed_raw; it never reads or changes
+the corresponding raw/inspire/NAME directory.
 EOF
 }
 
@@ -117,6 +127,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output=*)
             DATASET_ROOT="${1#*=}"
+            shift
+            ;;
+        --datasets-root)
+            [[ $# -ge 2 ]] || die "--datasets-root requires a path."
+            DATASETS_ROOT="$2"
+            shift 2
+            ;;
+        --datasets-root=*)
+            DATASETS_ROOT="${1#*=}"
+            shift
+            ;;
+        --dataset-name)
+            [[ $# -ge 2 ]] || die "--dataset-name requires a value."
+            DATASET_NAME="$2"
+            shift 2
+            ;;
+        --dataset-name=*)
+            DATASET_NAME="${1#*=}"
             shift
             ;;
         --repo-id)
@@ -213,6 +241,20 @@ case "$SPLIT_STRATEGY" in
     goal-stratified|session-grouped) ;;
     *) die "--split-strategy must be goal-stratified or session-grouped." ;;
 esac
+if [[ -n "$DATASET_NAME" ]]; then
+    [[ "$DATASET_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        die "--dataset-name must be one safe directory name."
+    [[ "$DATASET_NAME" != "." && "$DATASET_NAME" != ".." ]] || \
+        die "--dataset-name must not be '.' or '..'."
+fi
+[[ -n "$DATASETS_ROOT" ]] || die "--datasets-root must not be empty."
+DATASETS_ROOT="$(realpath -m "$DATASETS_ROOT")"
+
+if [[ -n "$DATASET_NAME" ]]; then
+    SOURCE_ROOT="${SOURCE_ROOT:-$DATASETS_ROOT/processed_raw/inspire/$DATASET_NAME}"
+    DATASET_ROOT="${DATASET_ROOT:-$DATASETS_ROOT/lerobot2/inspire/$DATASET_NAME}"
+fi
+
 [[ "$SPLIT_SEED" =~ ^-?[0-9]+$ ]] || die "--split-seed must be an integer."
 [[ "$SPLIT_SEARCH_TRIALS" =~ ^[1-9][0-9]*$ ]] || \
     die "--split-search-trials must be a positive integer."

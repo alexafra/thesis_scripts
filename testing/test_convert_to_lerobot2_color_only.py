@@ -141,6 +141,19 @@ def test_color_only_preflight_accepts_episode_without_depth(tmp_path: Path):
     assert "no files were converted or replaced" in result.stdout
 
 
+def test_preflight_accepts_canonical_embodiment_subdirectories(tmp_path: Path):
+    datasets = tmp_path / "Datasets"
+    for embodiment in ("dex3", "inspire"):
+        source = datasets / "processed_raw" / embodiment / "example_task"
+        _write_episode(source)
+
+        result = _run(source, "--preflight-only", "--color-only")
+
+        assert result.returncode == 0, result.stdout
+        assert (source / "episode_000000" / "data.json").is_file()
+        assert "no files were converted or replaced" in result.stdout
+
+
 def test_default_preflight_still_requires_depth(tmp_path: Path):
     _write_episode(tmp_path)
     result = _run(tmp_path, "--preflight-only")

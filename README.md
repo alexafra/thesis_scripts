@@ -9,19 +9,41 @@ uses `convert_to_lerobot2.sh` for the full RGB, gray-depth, lossless-depth, and
 surface-normal LeRobot v2.1 conversion. It never changes the raw source and has
 no episode filtering or exclusion behavior.
 
-No mode is implicit. Preflight a raw dataset without writing anything:
+The canonical dataset hierarchy is:
+
+```text
+/home/alex/Development/Datasets/
+├── raw/{dex3,inspire}/<dataset>/
+├── processed_raw/{dex3,inspire}/<dataset>/
+└── lerobot2/{dex3,inspire}/<dataset>/
+```
+
+The Inspire coordinator can resolve its two working paths from one safe leaf
+name. It starts at `processed_raw`; the matching `raw` directory is never read,
+copied, or modified:
+
+```bash
+./prepare_inspire_lerobot2.sh check --dataset-name pick_place_red_cup_08_13
+./prepare_inspire_lerobot2.sh convert --dataset-name pick_place_red_cup_08_13
+```
+
+Set `DATASETS_ROOT` or pass `--datasets-root` when the three stage directories
+live somewhere else. Explicit `--source` and `--output` paths remain supported
+for staging and compatibility.
+
+No mode is implicit. Preflight a processed-raw dataset without writing anything:
 
 ```bash
 ./prepare_inspire_lerobot2.sh check \
-  --source /path/to/processed_raw/task
+  --source /path/to/processed_raw/inspire/task
 ```
 
 Convert and publish one dataset:
 
 ```bash
 ./prepare_inspire_lerobot2.sh convert \
-  --source /path/to/processed_raw/task \
-  --output /path/to/lerobot2/task \
+  --source /path/to/processed_raw/inspire/task \
+  --output /path/to/lerobot2/inspire/task \
   --repo-id task \
   --split-strategy goal-stratified \
   --split-seed 42
@@ -39,8 +61,8 @@ lineage; the environment values are forwarded through split conversion:
 ```bash
 DEPTH_NEAR_M=0.3 DEPTH_FAR_M=3.0 \
   ./prepare_inspire_lerobot2.sh convert \
-  --source /path/to/processed_raw/task \
-  --output /path/to/lerobot2/task
+  --source /path/to/processed_raw/inspire/task \
+  --output /path/to/lerobot2/inspire/task
 ```
 
 `convert_to_lerobot2.sh` validates any recorded
@@ -62,8 +84,8 @@ explicitly only when preserving a genuinely untagged legacy lineage:
 ```bash
 ./prepare_inspire_lerobot2.sh convert \
   --camera-calibration-profile legacy-untagged \
-  --source /path/to/legacy_processed_raw/task \
-  --output /path/to/lerobot2/untagged_task
+  --source /path/to/processed_raw/inspire/legacy_task \
+  --output /path/to/lerobot2/inspire/legacy_task
 ```
 
 Append accepts legacy-with-legacy datasets and requires matching calibration
@@ -74,8 +96,8 @@ Check training readiness or deliberately start the three-model training and
 validation run:
 
 ```bash
-./prepare_inspire_lerobot2.sh training-check --output /path/to/lerobot2/task
-./prepare_inspire_lerobot2.sh train --output /path/to/lerobot2/task
+./prepare_inspire_lerobot2.sh training-check --dataset-name task
+./prepare_inspire_lerobot2.sh train --dataset-name task
 ```
 
 `multi_finetune_evaluation.sh` runs each selected model as a complete
@@ -88,7 +110,7 @@ Passing the original `--source` to either command additionally rechecks exact
 raw-to-split provenance. `all` is the only mode that performs conversion and
 then starts training, and it must be selected explicitly. Every option also has
 an uppercase environment equivalent, such as `SOURCE_ROOT`, `DATASET_ROOT`,
-`REPO_ID`, `SPLIT_STRATEGY`, and `SPLIT_SEED`.
+`DATASETS_ROOT`, `DATASET_NAME`, `REPO_ID`, `SPLIT_STRATEGY`, and `SPLIT_SEED`.
 
 There is no merge step when converting a single processed-raw population. To
 append an independently converted Inspire FTP component to an existing LeRobot
