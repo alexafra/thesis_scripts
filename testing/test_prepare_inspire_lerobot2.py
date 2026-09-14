@@ -9,6 +9,7 @@ import sys
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 PIPELINE = SCRIPTS_DIR / "prepare_inspire_lerobot2.sh"
 SPLITTER = SCRIPTS_DIR / "split_dataset.py"
+MULTI_TRAIN = SCRIPTS_DIR / "multi_finetune_evaluation.sh"
 
 
 def _write_executable(path: Path, text: str) -> None:
@@ -34,11 +35,51 @@ def _make_raw(root: Path, episode_count: int) -> None:
         )
 
 
+def _make_unique_raw(root: Path, dataset_name: str, episode_count: int) -> None:
+    root.mkdir(parents=True)
+    for episode_index in range(episode_count):
+        episode = root / f"episode_{episode_index:04d}"
+        episode.mkdir()
+        (episode / "data.json").write_text(
+            json.dumps(
+                {
+                    "identity": f"{dataset_name}/{episode_index}",
+                    "text": {
+                        "goal": "pick up cup" if episode_index % 2 else "put down cup"
+                    },
+                    "timing": {
+                        "capture_start_utc": (
+                            f"2026-09-15T00:00:{dataset_name}-{episode_index:04d}Z"
+                        )
+                    },
+                    "data": [
+                        {"frame_index": frame} for frame in range(episode_index + 1)
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+def _make_minimal_dex3_lerobot(root: Path) -> None:
+    info = {
+        "robot_type": "Unitree_G1_Dex3_HeadOnly",
+        "features": {"observation.images.ego_view": {"dtype": "video"}},
+    }
+    for split in ("train", "validation", "test"):
+        metadata = root / split / "meta"
+        metadata.mkdir(parents=True)
+        (metadata / "info.json").write_text(json.dumps(info), encoding="utf-8")
+
+
 def _fake_environment(tmp_path: Path) -> dict[str, str]:
     converter = tmp_path / "fake_convert.sh"
     trainer = tmp_path / "fake_train.sh"
     convert_log = tmp_path / "convert.log"
     train_log = tmp_path / "train.log"
+    pgrep = tmp_path / "fake_pgrep.sh"
+
+    _write_executable(pgrep, "#!/usr/bin/env bash\nexit 1\n")
 
     _write_executable(
         converter,
@@ -134,6 +175,7 @@ printf 'precheck=%s dataset=%s suffix=%s\n' \
         "TRAIN_SCRIPT": str(trainer),
         "CONVERT_LOG": str(convert_log),
         "TRAIN_LOG": str(train_log),
+        "DATA_EDITOR_PGREP": str(pgrep),
     }
 
 
@@ -192,7 +234,51 @@ def test_no_mode_does_not_run_any_stage(tmp_path: Path) -> None:
     assert not Path(environment["TRAIN_LOG"]).exists()
 
 
-def test_convert_includes_all_137_episodes_and_builds_three_splits(tmp_path: Path) -> None:
+def test_multi_train_default_prefers_existing_nested_dex3_then_falls_back(
+    tmp_path: Path,
+) -> None:
+    dataset_name = (
+        "atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_"
+        "plus_stack_cups_09_08"
+    )
+    legacy = tmp_path / "Datasets" / "lerobot2" / dataset_name
+    nested = tmp_path / "Datasets" / "lerobot2" / "dex3" / dataset_name
+    _make_minimal_dex3_lerobot(legacy)
+    environment = {
+        **os.environ,
+        "DATASETS_ROOT": str(tmp_path / "Datasets"),
+        "PRECHECK_ONLY": "1",
+        "EXPERIMENTS": "rgb",
+        "MODEL_PREFIX": f"path_test_{tmp_path.name}_",
+        "RUN_SUFFIX": f"path_test_{tmp_path.name}",
+        "LOG_ROOT": str(tmp_path / "logs"),
+    }
+
+    fallback = subprocess.run(
+        [str(MULTI_TRAIN)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert fallback.returncode == 0, fallback.stderr
+    assert f"Dataset root:       {legacy}" in fallback.stdout
+
+    _make_minimal_dex3_lerobot(nested)
+    preferred = subprocess.run(
+        [str(MULTI_TRAIN)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert preferred.returncode == 0, preferred.stderr
+    assert f"Dataset root:       {nested}" in preferred.stdout
+
+
+def test_convert_includes_all_137_episodes_and_builds_three_splits(
+    tmp_path: Path,
+) -> None:
     environment = _fake_environment(tmp_path)
     source = tmp_path / "processed_raw"
     output = tmp_path / "lerobot2"
@@ -201,7 +287,10 @@ def test_convert_includes_all_137_episodes_and_builds_three_splits(tmp_path: Pat
     result = _run("convert", source, output, environment)
 
     assert "Raw population: 137 episodes; all will be included." in result.stdout
-    assert "Split population: train=109, validation=14, test=14; total=137" in result.stdout
+    assert (
+        "Split population: train=109, validation=14, test=14; total=137"
+        in result.stdout
+    )
     assert len(list(source.glob("episode_*"))) == 137
     assert not Path(f"{output}.building").exists()
     manifest = json.loads((output / "split_manifest.json").read_text(encoding="utf-8"))
@@ -217,9 +306,206 @@ def test_convert_includes_all_137_episodes_and_builds_three_splits(tmp_path: Pat
     assert "--preflight-only" in calls[0]
     assert all("--include-surface-normals" in call for call in calls)
     assert all("--end-effector inspire-ftp" in call for call in calls)
-    assert all("--camera-calibration-profile d435i-254322071415" in call for call in calls)
+    assert all(
+        "--camera-calibration-profile d435i-254322071415" in call for call in calls
+    )
     assert all("near=0.25 far=1.0 profile=d435i-254322071415" in call for call in calls)
     assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_collection_convert_preserves_one_split_and_excludes_exact_dataset(
+    tmp_path: Path,
+) -> None:
+    environment = _fake_environment(tmp_path)
+    source = tmp_path / "processed_raw" / "inspire"
+    _make_unique_raw(source / "preserved", "preserved", 6)
+    _make_unique_raw(source / "new_task", "new_task", 10)
+    _make_unique_raw(source / "data_colour_only_test", "excluded", 3)
+    curation = source / "curation_manifest_20260915.json"
+    curation.write_text('{"curated": true}\n', encoding="utf-8")
+
+    preserved_records = []
+    expected_membership = {}
+    split_indices = {"train": 0, "test": 0, "validation": 0}
+    for index in range(6):
+        episode_name = f"episode_{index:04d}"
+        split = "train" if index < 4 else ("validation" if index == 4 else "test")
+        expected_membership[episode_name] = split
+        split_indices[split] += 1
+        preserved_records.append(
+            {
+                "split": split,
+                "split_episode": f"episode_{split_indices[split]:04d}",
+                "flattened_episode": episode_name,
+                "source_episode": episode_name,
+                "goal": "old goal",
+                "frame_count": 999,
+                "data_json_sha256": "0" * 64,
+            }
+        )
+    preserved_manifest = tmp_path / "preserved_manifest.json"
+    preserved_manifest.write_text(
+        json.dumps({"version": 1, "episodes": preserved_records}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "lerobot2" / "inspire" / "combined"
+
+    result = subprocess.run(
+        [
+            str(PIPELINE),
+            "convert",
+            "--collection-source",
+            str(source),
+            "--output",
+            str(output),
+            "--repo-id",
+            "combined",
+            "--exclude-dataset",
+            "data_colour_only_test",
+            "--preserve-split",
+            f"preserved={preserved_manifest}",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((output / "split_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["strategy"] == "component-preserved"
+    assert manifest["episode_count"] == 16
+    counts = {
+        split: sum(record["split"] == split for record in manifest["episodes"])
+        for split in ("train", "validation", "test")
+    }
+    assert counts == {"train": 12, "validation": 2, "test": 2}
+    assert {
+        record["source_episode"]: record["split"]
+        for record in manifest["episodes"]
+        if record["source_dataset"] == "preserved"
+    } == expected_membership
+    assert not any(
+        record["source_dataset"] == "data_colour_only_test"
+        for record in manifest["episodes"]
+    )
+    assert (output / "provenance" / curation.name).read_bytes() == curation.read_bytes()
+    preserved_component = next(
+        component
+        for component in manifest["components"]
+        if component["dataset"] == "preserved"
+    )
+    embedded_assignment = output / preserved_component["assignment_manifest_copy"]
+    assert embedded_assignment.read_bytes() == preserved_manifest.read_bytes()
+    calls = Path(environment["CONVERT_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 3
+    assert sum("--preflight-only" in call for call in calls) == 2
+    assert sum("--preflight-only" not in call for call in calls) == 1
+
+    validation_args = [
+        str(PIPELINE),
+        "training-check",
+        "--collection-source",
+        str(source),
+        "--output",
+        str(output),
+        "--repo-id",
+        "combined",
+        "--exclude-dataset",
+        "data_colour_only_test",
+        "--preserve-split",
+        f"preserved={preserved_manifest}",
+    ]
+    validation = subprocess.run(
+        validation_args,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validation.returncode == 0, validation.stderr
+
+    preserved_manifest.write_text(
+        preserved_manifest.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    stale_validation = subprocess.run(
+        validation_args,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert stale_validation.returncode != 0
+    assert "preserved assignment manifest changed" in stale_validation.stderr
+
+    preserved_manifest.unlink()
+    self_contained_validation = subprocess.run(
+        [
+            str(PIPELINE),
+            "training-check",
+            "--collection-source",
+            str(source),
+            "--output",
+            str(output),
+            "--repo-id",
+            "combined",
+            "--exclude-dataset",
+            "data_colour_only_test",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert self_contained_validation.returncode == 0, self_contained_validation.stderr
+
+    embedded_assignment.write_text("{}\n", encoding="utf-8")
+    corrupt_embedded_validation = subprocess.run(
+        self_contained_validation.args,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert corrupt_embedded_validation.returncode != 0
+    assert (
+        "embedded preserved assignment-manifest hash differs"
+        in corrupt_embedded_validation.stderr
+    )
+
+
+def test_collection_convert_refuses_active_data_editor(tmp_path: Path) -> None:
+    environment = _fake_environment(tmp_path)
+    source = tmp_path / "processed_raw" / "inspire"
+    _make_unique_raw(source / "task", "task", 3)
+    output = tmp_path / "output"
+    active_pgrep = tmp_path / "active_pgrep.sh"
+    _write_executable(
+        active_pgrep,
+        "#!/usr/bin/env bash\nprintf '123 python data_editor_EN_rgbd.py\\n'\nexit 0\n",
+    )
+    environment["DATA_EDITOR_PGREP"] = str(active_pgrep)
+
+    result = subprocess.run(
+        [
+            str(PIPELINE),
+            "convert",
+            "--collection-source",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Close every data_editor_EN_rgbd.py" in result.stderr
+    assert not output.exists()
+    assert not Path(environment["CONVERT_LOG"]).exists()
 
 
 def test_convert_accepts_canonical_inspire_stage_hierarchy(tmp_path: Path) -> None:
@@ -386,7 +672,9 @@ def test_depth_range_and_calibration_profile_overrides_reach_every_conversion_ca
     assert all("near=0.3 far=3.0 profile=legacy-untagged" in call for call in calls)
 
 
-def test_training_check_train_and_all_are_distinct_explicit_modes(tmp_path: Path) -> None:
+def test_training_check_train_and_all_are_distinct_explicit_modes(
+    tmp_path: Path,
+) -> None:
     environment = _fake_environment(tmp_path)
     source = tmp_path / "processed_raw"
     output = tmp_path / "lerobot2"
@@ -395,7 +683,9 @@ def test_training_check_train_and_all_are_distinct_explicit_modes(tmp_path: Path
 
     _run("training-check", source, output, environment)
     _run("train", source, output, environment)
-    training_calls = Path(environment["TRAIN_LOG"]).read_text(encoding="utf-8").splitlines()
+    training_calls = (
+        Path(environment["TRAIN_LOG"]).read_text(encoding="utf-8").splitlines()
+    )
     assert training_calls[0].startswith("precheck=1 ")
     assert training_calls[1].startswith("precheck=0 ")
 
@@ -403,7 +693,9 @@ def test_training_check_train_and_all_are_distinct_explicit_modes(tmp_path: Path
     all_output = tmp_path / "all_lerobot2"
     _make_raw(all_source, 3)
     _run("all", all_source, all_output, environment)
-    training_calls = Path(environment["TRAIN_LOG"]).read_text(encoding="utf-8").splitlines()
+    training_calls = (
+        Path(environment["TRAIN_LOG"]).read_text(encoding="utf-8").splitlines()
+    )
     assert len(training_calls) == 3
     assert training_calls[-1].startswith("precheck=0 ")
     assert all_output.is_dir()

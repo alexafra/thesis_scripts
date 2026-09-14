@@ -3,7 +3,16 @@ set -euo pipefail
 
 cd "$HOME/Development/Isaac-GR00T"
 
-DATASET_ROOT="${DATASET_ROOT:-/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08}"
+DATASETS_ROOT="${DATASETS_ROOT:-/home/alex/Development/Datasets}"
+DEFAULT_DEX3_DATASET_NAME="atomic_combined_09_08_And_10_08_plus_pick_three_cups_right_only_1408_plus_stack_cups_09_08"
+NESTED_DEX3_DATASET="$DATASETS_ROOT/lerobot2/dex3/$DEFAULT_DEX3_DATASET_NAME"
+LEGACY_DEX3_DATASET="$DATASETS_ROOT/lerobot2/$DEFAULT_DEX3_DATASET_NAME"
+if [[ -d "$NESTED_DEX3_DATASET" ]]; then
+    DEFAULT_DATASET_ROOT="$NESTED_DEX3_DATASET"
+else
+    DEFAULT_DATASET_ROOT="$LEGACY_DEX3_DATASET"
+fi
+DATASET_ROOT="${DATASET_ROOT:-$DEFAULT_DATASET_ROOT}"
 TRAIN_DATASET="${TRAIN_DATASET:-$DATASET_ROOT/train}"
 VALIDATION_DATASET="${VALIDATION_DATASET:-$DATASET_ROOT/validation}"
 TEST_DATASET="${TEST_DATASET:-$DATASET_ROOT/test}"
@@ -224,6 +233,7 @@ if missing:
 print(f"Local-only Cosmos cache: {snapshot}")
 PY
 
+echo "Dataset root:       $DATASET_ROOT"
 echo "Dataset robot type: $DATASET_ROBOT_TYPE"
 echo "Model prefix:       ${MODEL_PREFIX:-<none>}"
 echo "Experiments:        ${SELECTED_EXPERIMENTS[*]}"

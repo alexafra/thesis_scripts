@@ -2,12 +2,13 @@
 
 ## General Inspire dataset pipeline
 
-`prepare_inspire_lerobot2.sh` is the reusable coordinator for one complete,
-already-curated `processed_raw` dataset. It stages every direct `episode_*`,
-creates deterministic train/validation/test splits with `split_dataset.py`, and
-uses `convert_to_lerobot2.sh` for the full RGB, gray-depth, lossless-depth, and
-surface-normal LeRobot v2.1 conversion. It never changes the raw source and has
-no episode filtering or exclusion behavior.
+`prepare_inspire_lerobot2.sh` is the reusable coordinator for either one complete,
+already-curated `processed_raw` dataset or a parent containing several curated
+dataset leaves. It creates deterministic train/validation/test splits with
+`split_dataset.py`, then uses `convert_to_lerobot2.sh` once for the full RGB,
+gray-depth, lossless-depth, and surface-normal LeRobot v2.1 conversion. It never
+changes the processed-raw source. Single-dataset mode includes every direct
+`episode_*`; collection mode can exclude only explicitly named child datasets.
 
 The canonical dataset hierarchy is:
 
@@ -48,6 +49,43 @@ Convert and publish one dataset:
   --split-strategy goal-stratified \
   --split-seed 42
 ```
+
+Compose several leaves directly into one final LeRobot dataset with no retained
+per-leaf converted intermediates:
+
+```bash
+./prepare_inspire_lerobot2.sh check \
+  --collection-source /home/alex/Development/Datasets/processed_raw/inspire \
+  --output /home/alex/Development/Datasets/lerobot2/inspire/all_tasks_452eps_20260915 \
+  --exclude-dataset data_colour_only_test \
+  --preserve-split pick_place_red_cup_08_13=/home/alex/Development/Datasets/lerobot2/inspire/pick_place_red_cup_08_13/split_manifest.json \
+  --split-strategy goal-stratified \
+  --split-seed 42
+```
+
+`--preserve-split` preserves that leaf's existing membership and within-split
+order while refreshing its current goal, frame-count, and `data.json` hash
+provenance. Every unpreserved leaf is split independently with the requested
+strategy and seed before the component splits are appended train-to-train,
+validation-to-validation, and test-to-test. The current six-leaf Inspire plan is
+452 episodes: 364 train, 44 validation, and 44 test. The 137-episode red-cup
+assignments remain 109/14/14; `data_colour_only_test` is excluded exactly.
+
+For the deliberately authorized conversion-plus-training run, change `check` to
+`all` and add `--run-suffix all_tasks_452eps_20260915`. The three 25,000-step
+stages then run sequentially as RGB train/evaluate, surface-normal
+train/evaluate, and gray-depth train/evaluate, saving at steps 5,000, 10,000,
+15,000, 20,000, and 25,000. Use `convert` instead of `all` when training should
+not start.
+
+Collection mode rejects symlinks, nested dataset wrappers, duplicate episode
+content/capture identifiers, an existing output or staging directory, and an
+active `data_editor_EN_rgbd.py`. It copies rather than mutates sources, verifies
+the source hash snapshot after staging, preserves the optional root curation
+manifest under `provenance/`, and publishes only after the converted population
+and modality contracts validate. Every preserved split manifest is also copied
+under `provenance/` and hash-validated, so later validation does not depend on
+the older per-task LeRobot directory remaining present.
 
 The current 137-episode red-cup source therefore targets 109 train, 14
 validation, and 14 test episodes. The pipeline verifies the exact raw episode
@@ -104,7 +142,10 @@ validation run:
 train-then-validation-evaluate stage. Its default order is RGB, surface
 normals, then gray depth so the depth stage can be stopped without affecting
 the completed RGB and normals results. Override the ordered subset with, for
-example, `EXPERIMENTS=rgb,normals`.
+example, `EXPERIMENTS=rgb,normals`. Its Dex3 default prefers the canonical
+`lerobot2/dex3/` dataset when that dataset exists, otherwise it retains the
+legacy flat `lerobot2/` fallback during migration. An explicit `DATASET_ROOT`
+always takes precedence.
 
 Passing the original `--source` to either command additionally rechecks exact
 raw-to-split provenance. `all` is the only mode that performs conversion and
