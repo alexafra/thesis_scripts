@@ -43,14 +43,28 @@ def _provenance(protocol: str = "dfx") -> dict:
     }
 
 
-def _write_episode(root: Path, *, provenance: bool = True, color: bool = True) -> Path:
-    episode = root / "episode_000000"
+def _write_episode(
+    root: Path,
+    *,
+    provenance: bool = True,
+    color: bool = True,
+    depth: bool = False,
+    depth_scale=...,
+    name: str = "episode_000000",
+    calibration=...,
+) -> Path:
+    episode = root / name
     episode.mkdir(parents=True)
     colors = episode / "colors"
     colors.mkdir()
     color_path = colors / "000000_color_0.jpg"
     if color:
         color_path.write_bytes(b"preflight-only fixture")
+    depths = episode / "depths"
+    if depth:
+        depths.mkdir()
+        (depths / "000000_depth_0.png").write_bytes(b"aligned depth fixture")
+        (depths / "000000_raw_depth_0.png").write_bytes(b"raw depth fixture")
 
     def components() -> dict:
         return {
@@ -63,13 +77,24 @@ def _write_episode(root: Path, *, provenance: bool = True, color: bool = True) -
     info = {}
     if provenance:
         info["end_effector"] = _provenance()
+    if depth_scale is not ...:
+        info["depth"] = {"scale_m_per_unit": depth_scale}
+    if calibration is not ...:
+        info.setdefault("depth", {})["calibration"] = calibration
     payload = {
         "info": info,
         "data": [
             {
                 "idx": 0,
                 "colors": {"color_0": "colors/000000_color_0.jpg"},
-                "depths": {},
+                "depths": (
+                    {
+                        "depth_0": "depths/000000_depth_0.png",
+                        "raw_depth_0": "depths/000000_raw_depth_0.png",
+                    }
+                    if depth
+                    else {}
+                ),
                 "states": components(),
                 "actions": components(),
             }
@@ -121,6 +146,64 @@ def test_default_preflight_still_requires_depth(tmp_path: Path):
     result = _run(tmp_path, "--preflight-only")
     assert result.returncode != 0
     assert "Missing depths.depth_0" in result.stdout
+
+
+def test_rgbd_preflight_accepts_float32_realsense_scale_spelling(tmp_path: Path):
+    _write_episode(
+        tmp_path,
+        depth=True,
+        depth_scale=0.0010000000474974513,
+    )
+
+    result = _run(tmp_path, "--preflight-only")
+
+    assert result.returncode == 0, result.stdout
+    assert "Validated 1 RGB-D frames" in result.stdout
+
+
+def test_rgbd_preflight_accepts_missing_legacy_scale(tmp_path: Path):
+    _write_episode(tmp_path, depth=True)
+
+    result = _run(tmp_path, "--preflight-only")
+
+    assert result.returncode == 0, result.stdout
+
+
+def test_rgbd_preflight_rejects_noncanonical_depth_scale(tmp_path: Path):
+    _write_episode(tmp_path, depth=True, depth_scale=0.0011)
+
+    result = _run(tmp_path, "--preflight-only")
+
+    assert result.returncode != 0
+    assert "not float32-equal to 0.001 m/unit" in result.stdout
+
+
+def test_rgbd_preflight_rejects_noncanonical_reported_depth_scale(tmp_path: Path):
+    episode = _write_episode(tmp_path, depth=True, depth_scale=0.001)
+    data_path = episode / "data.json"
+    payload = json.loads(data_path.read_text(encoding="utf-8"))
+    payload["info"]["depth"]["scale_reported_m_per_unit"] = 0.002
+    data_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _run(tmp_path, "--preflight-only")
+
+    assert result.returncode != 0
+    assert "info.depth.scale_reported_m_per_unit" in result.stdout
+
+
+def test_rgbd_preflight_rejects_mixed_calibration_tagging(tmp_path: Path):
+    _write_episode(
+        tmp_path,
+        depth=True,
+        name="episode_000001",
+        calibration={"fixture": "present"},
+    )
+    _write_episode(tmp_path, depth=True, name="episode_000002")
+
+    result = _run(tmp_path, "--preflight-only")
+
+    assert result.returncode != 0
+    assert "mixes calibration-tagged and legacy episodes" in result.stdout
 
 
 def test_color_only_rejects_surface_normals(tmp_path: Path):

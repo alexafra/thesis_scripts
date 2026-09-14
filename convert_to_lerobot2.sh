@@ -19,6 +19,7 @@ Usage:
   convert_to_lerobot2.sh [--color-only] [--include-surface-normals] \
       [--preflight-only] \
       [--end-effector TYPE] \
+      [--camera-calibration-profile PROFILE] \
       PATH/TO/INPUT_COPY [REPO_ID] [JOBS]
 
 The input must be either:
@@ -53,6 +54,10 @@ Options:
                       the default. It cannot be combined with surface normals.
   --preflight-only     Validate all raw episodes and referenced media files,
                       then exit without converting or replacing anything.
+  --camera-calibration-profile PROFILE
+                      Fallback calibration for legacy episodes without recorded
+                      info.depth.calibration. Default: legacy-untagged. Use
+                      d435i-254322071415 only for a deliberate calibrated lineage.
 
 Environment overrides:
   UNITREE_LEROBOT_REPO  Default: ~/Development/unitree_lerobot
@@ -60,6 +65,9 @@ Environment overrides:
   UNITREE_PYTHON        Default: ~/miniconda3/envs/unitree_lerobot/bin/python
   DEPTH_NEAR_M          Default: 0.25
   DEPTH_FAR_M           Default: 1.0
+  CAMERA_CALIBRATION_PROFILE
+                        Default: legacy-untagged. Recorded episode calibration
+                        takes precedence inside the Unitree converter.
   INCLUDE_SURFACE_NORMALS
                         Default: 0. Set to 1 to add surface_normals_view.
 EOF
@@ -73,6 +81,7 @@ die() {
 INCLUDE_SURFACE_NORMALS="${INCLUDE_SURFACE_NORMALS:-0}"
 COLOR_ONLY=0
 END_EFFECTOR="dex3"
+CAMERA_CALIBRATION_PROFILE="${CAMERA_CALIBRATION_PROFILE:-legacy-untagged}"
 PREFLIGHT_ONLY=0
 declare -a POSITIONAL_ARGS=()
 
@@ -93,6 +102,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --end-effector=*)
             END_EFFECTOR="${1#*=}"
+            shift
+            ;;
+        --camera-calibration-profile)
+            [[ $# -ge 2 ]] || die "--camera-calibration-profile requires a value."
+            CAMERA_CALIBRATION_PROFILE="$2"
+            shift 2
+            ;;
+        --camera-calibration-profile=*)
+            CAMERA_CALIBRATION_PROFILE="${1#*=}"
             shift
             ;;
         --preflight-only)
@@ -150,6 +168,17 @@ ISAAC_GROOT_REPO="${ISAAC_GROOT_REPO:-$HOME/Development/Isaac-GR00T}"
 UNITREE_PYTHON="${UNITREE_PYTHON:-$HOME/miniconda3/envs/unitree_lerobot/bin/python}"
 DEPTH_NEAR_M="${DEPTH_NEAR_M:-0.25}"
 DEPTH_FAR_M="${DEPTH_FAR_M:-1.0}"
+export DEPTH_NEAR_M DEPTH_FAR_M
+export CAMERA_CALIBRATION_PROFILE
+
+[[ -n "$CAMERA_CALIBRATION_PROFILE" ]] || \
+    die "CAMERA_CALIBRATION_PROFILE must not be empty."
+case "$CAMERA_CALIBRATION_PROFILE" in
+    legacy-untagged|d435i-254322071415) ;;
+    *)
+        die "Unsupported camera calibration profile '$CAMERA_CALIBRATION_PROFILE'; choose legacy-untagged or d435i-254322071415."
+        ;;
+esac
 
 [[ "$INCLUDE_SURFACE_NORMALS" == 0 || "$INCLUDE_SURFACE_NORMALS" == 1 ]] || \
     die "INCLUDE_SURFACE_NORMALS must be 0 or 1."
@@ -198,6 +227,25 @@ esac
 
 [[ -x "$UNITREE_PYTHON" ]] || \
     die "Unitree environment Python is missing: $UNITREE_PYTHON"
+
+if [[ "$COLOR_ONLY" == 0 ]]; then
+    "$UNITREE_PYTHON" - "$DEPTH_NEAR_M" "$DEPTH_FAR_M" <<'PY'
+import math
+import sys
+
+try:
+    near_m = float(sys.argv[1])
+    far_m = float(sys.argv[2])
+except ValueError as exc:
+    raise SystemExit(f"ERROR: depth bounds must be numeric: {exc}") from exc
+if not math.isfinite(near_m) or not math.isfinite(far_m):
+    raise SystemExit("ERROR: depth bounds must be finite")
+if far_m <= near_m:
+    raise SystemExit(
+        f"ERROR: DEPTH_FAR_M ({far_m}) must be greater than DEPTH_NEAR_M ({near_m})"
+    )
+PY
+fi
 
 [[ -f "$UNITREE_CONVERTER" ]] || \
     die "Unitree converter is missing: $UNITREE_CONVERTER"
@@ -269,7 +317,11 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
         split_dir="${SPLIT_DIRS[$index]}"
         split_suffix="${SPLIT_SUFFIXES[$index]}"
         split_repo_id="${REPO_ID}_${split_suffix}"
-        preflight_args=(--preflight-only --end-effector "$END_EFFECTOR")
+        preflight_args=(
+            --preflight-only
+            --end-effector "$END_EFFECTOR"
+            --camera-calibration-profile "$CAMERA_CALIBRATION_PROFILE"
+        )
         if [[ "$COLOR_ONLY" == 1 ]]; then
             preflight_args+=(--color-only)
         fi
@@ -297,7 +349,10 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
             "$(basename "$split_dir")" \
             "$split_repo_id"
 
-        recursive_args=(--end-effector "$END_EFFECTOR")
+        recursive_args=(
+            --end-effector "$END_EFFECTOR"
+            --camera-calibration-profile "$CAMERA_CALIBRATION_PROFILE"
+        )
         if [[ "$COLOR_ONLY" == 1 ]]; then
             recursive_args+=(--color-only)
         fi
@@ -358,16 +413,22 @@ done
 "$UNITREE_PYTHON" - \
     "$COLOR_ONLY" \
     "$INCLUDE_SURFACE_NORMALS" \
+    "$CAMERA_CALIBRATION_PROFILE" \
     "${EPISODE_DIRS[@]}" <<'PY'
 import json
+import math
 from pathlib import Path
+import struct
 import sys
 
 color_only = bool(int(sys.argv[1]))
 include_depth = not color_only
 include_surface_normals = bool(int(sys.argv[2]))
+camera_calibration_profile = sys.argv[3]
 total_frames = 0
 validated = {"color_0": 0, "depth_0": 0, "raw_depth_0": 0}
+episode_calibrations = []
+episode_paths = []
 
 
 def require_media(episode, frame, frame_index, section, key):
@@ -391,10 +452,39 @@ def require_media(episode, frame, frame_index, section, key):
     validated[key] += 1
 
 
-for episode_arg in sys.argv[3:]:
+for episode_arg in sys.argv[4:]:
     episode = Path(episode_arg).resolve()
     with (episode / "data.json").open(encoding="utf-8") as file:
         payload = json.load(file)
+
+    if include_depth:
+        depth_info = payload.get("info", {}).get("depth", {})
+        if not isinstance(depth_info, dict):
+            raise ValueError(f"Invalid info.depth object in {episode}/data.json")
+        for scale_key in ("scale_m_per_unit", "scale_reported_m_per_unit"):
+            stored_scale = depth_info.get(scale_key)
+            if stored_scale is None:
+                continue
+            try:
+                parsed_scale = float(stored_scale)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Invalid info.depth.{scale_key} in {episode}/data.json: "
+                    f"{stored_scale!r}"
+                ) from exc
+            try:
+                float32_matches = struct.pack("!f", parsed_scale) == struct.pack(
+                    "!f", 0.001
+                )
+            except OverflowError:
+                float32_matches = False
+            if not math.isfinite(parsed_scale) or not float32_matches:
+                raise ValueError(
+                    f"Depth scale info.depth.{scale_key} in {episode}/data.json "
+                    f"is not float32-equal to 0.001 m/unit: {stored_scale!r}"
+                )
+        episode_calibrations.append(depth_info.get("calibration"))
+        episode_paths.append(episode)
 
     frames = payload.get("data", [])
     if not frames:
@@ -412,6 +502,45 @@ for episode_arg in sys.argv[3:]:
             require_media(episode, frame, frame_index, "depths", "depth_0")
             require_media(episode, frame, frame_index, "depths", "raw_depth_0")
     total_frames += len(frames)
+
+if include_depth:
+    from unitree_lerobot.utils.camera_calibration import (
+        NAMED_CAMERA_CALIBRATIONS,
+        validate_realsense_rgbd_calibration,
+    )
+
+    calibration_present = [value is not None for value in episode_calibrations]
+    if any(calibration_present) and not all(calibration_present):
+        missing = [
+            str(path)
+            for path, present in zip(episode_paths, calibration_present, strict=True)
+            if not present
+        ]
+        raise ValueError(
+            "Raw dataset mixes calibration-tagged and legacy episodes; "
+            f"missing info.depth.calibration in {missing!r}"
+        )
+    recorded_calibration = None
+    if calibration_present and all(calibration_present):
+        recorded = [
+            validate_realsense_rgbd_calibration(value)
+            for value in episode_calibrations
+        ]
+        recorded_calibration = recorded[0]
+        if any(value != recorded_calibration for value in recorded[1:]):
+            raise ValueError("Raw dataset contains heterogeneous camera calibrations")
+
+    selected_calibration = NAMED_CAMERA_CALIBRATIONS.get(camera_calibration_profile)
+    if (
+        recorded_calibration is not None
+        and selected_calibration is not None
+        and recorded_calibration["fingerprint"] != selected_calibration["fingerprint"]
+    ):
+        raise ValueError(
+            f"Recorded camera calibration {recorded_calibration['fingerprint']} conflicts "
+            f"with profile {camera_calibration_profile!r} "
+            f"({selected_calibration['fingerprint']})"
+        )
 
 mode = "color-only" if color_only else "RGB-D"
 print(
@@ -487,6 +616,7 @@ printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
             --include-depth
             --depth-near-m "$DEPTH_NEAR_M"
             --depth-far-m "$DEPTH_FAR_M"
+            --camera-calibration-profile "$CAMERA_CALIBRATION_PROFILE"
         )
     fi
     if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
@@ -581,8 +711,10 @@ fi
     "$END_EFFECTOR" <<'PY'
 import cv2
 import json
+import math
 from pathlib import Path
 import shutil
+import struct
 import sys
 
 raw_root = Path(sys.argv[1])
@@ -631,7 +763,31 @@ for episode_index, episode in enumerate(episodes):
 
     if include_depth:
         depth_info = payload.get("info", {}).get("depth", {})
-        scale = float(depth_info.get("scale_m_per_unit", 0.001))
+        if not isinstance(depth_info, dict):
+            raise ValueError(f"Invalid info.depth object in {episode}/data.json")
+        for scale_key in ("scale_m_per_unit", "scale_reported_m_per_unit"):
+            stored_scale = depth_info.get(scale_key)
+            if stored_scale is None:
+                continue
+            try:
+                parsed_scale = float(stored_scale)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Invalid info.depth.{scale_key} in {episode}: "
+                    f"{stored_scale!r}"
+                ) from exc
+            try:
+                float32_matches = struct.pack("!f", parsed_scale) == struct.pack(
+                    "!f", 0.001
+                )
+            except OverflowError:
+                float32_matches = False
+            if not math.isfinite(parsed_scale) or not float32_matches:
+                raise ValueError(
+                    f"Depth scale info.depth.{scale_key} in {episode} is not "
+                    f"float32-equal to 0.001 m/unit: {stored_scale!r}"
+                )
+        scale = 0.001
         shape = (int(depth_info.get("height", 480)), int(depth_info.get("width", 640)))
         if expected_scale is None:
             expected_scale = scale
@@ -793,10 +949,16 @@ printf '[6/6] Validating metadata, episode count, selected media and video codec
     "$EXPECTED_VECTOR_DIM" \
     "$EXPECTED_HAND_DOF" \
     "$EXPECTED_RAW_TYPE" \
-    "$EXPECTED_RAW_PROTOCOL" <<'PY'
+    "$EXPECTED_RAW_PROTOCOL" \
+    "$CAMERA_CALIBRATION_PROFILE" <<'PY'
 import json
 from pathlib import Path
 import sys
+
+from unitree_lerobot.utils.camera_calibration import (
+    validate_calibration_identity,
+    validate_realsense_rgbd_calibration,
+)
 
 dataset = Path(sys.argv[1])
 expected_episodes = int(sys.argv[2])
@@ -810,6 +972,7 @@ expected_vector_dim = int(sys.argv[8])
 expected_hand_dof = int(sys.argv[9])
 expected_raw_type = sys.argv[10]
 expected_raw_protocol = sys.argv[11] or None
+camera_calibration_profile = sys.argv[12]
 
 with (dataset / "meta" / "info.json").open(encoding="utf-8") as file:
     info = json.load(file)
@@ -823,6 +986,12 @@ assert info["total_episodes"] == expected_episodes, (
 assert (dataset / "meta" / "modality.json").is_file()
 
 features = info["features"]
+camera_calibration = info.get("camera_calibration")
+if camera_calibration is not None:
+    camera_calibration = validate_realsense_rgbd_calibration(camera_calibration)
+if include_depth and camera_calibration_profile == "d435i-254322071415":
+    assert camera_calibration is not None
+    assert camera_calibration["camera"]["serial"] == "254322071415"
 
 assert features["observation.state"]["shape"] == [expected_vector_dim]
 assert features["action"]["shape"] == [expected_vector_dim]
@@ -848,6 +1017,7 @@ if include_depth:
     assert raw_depth_encoding["storage"] == "lossless_png"
     assert raw_depth_encoding["dtype"] == "uint16"
     assert raw_depth_encoding["shape"] == [480, 640]
+    assert raw_depth_encoding["scale_m_per_unit"] == 0.001
     assert raw_depth_encoding["total_files"] == info["total_frames"]
 else:
     assert "depth_encoding" not in info
@@ -867,12 +1037,24 @@ if include_surface_normals:
     assert surface_encoding["aligned_to"] == "color_0"
     assert surface_encoding["encoding"] == "camera_xyz_uint8"
     assert surface_encoding["encoding_version"] == 1
+    compact_calibration = surface_encoding.get("camera_calibration")
+    if camera_calibration is None:
+        assert compact_calibration is None
+    else:
+        compact_calibration = validate_calibration_identity(compact_calibration)
+        assert compact_calibration.schema == camera_calibration["schema"]
+        assert compact_calibration.fingerprint == camera_calibration["fingerprint"]
+        assert compact_calibration.model == camera_calibration["camera"]["model"]
+        assert compact_calibration.serial == camera_calibration["camera"]["serial"]
+        assert compact_calibration.product_id == camera_calibration["camera"]["product_id"]
+        assert compact_calibration.firmware == camera_calibration["camera"]["firmware"]
     aligned_depth_encoding = info["aligned_depth_encoding"]
     assert aligned_depth_encoding["source_key"] == "depth_0"
     assert aligned_depth_encoding["aligned_to"] == "color_0"
     assert aligned_depth_encoding["storage"] == "lossless_png"
     assert aligned_depth_encoding["dtype"] == "uint16"
     assert aligned_depth_encoding["shape"] == [480, 640]
+    assert aligned_depth_encoding["scale_m_per_unit"] == 0.001
     assert aligned_depth_encoding["total_files"] == info["total_frames"]
 
 chunks_size = int(info["chunks_size"])

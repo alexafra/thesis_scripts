@@ -32,6 +32,44 @@ validation, and 14 test episodes. The pipeline verifies the exact raw episode
 names and `data.json` hashes before publishing, as well as the 26D Inspire and
 RGB/depth/normals contract in all three converted splits.
 
+The production gray-depth model view remains on its fixed linear 0.25--1.0 m
+contract. Choose different bounds only for a new, consistently converted
+lineage; the environment values are forwarded through split conversion:
+
+```bash
+DEPTH_NEAR_M=0.3 DEPTH_FAR_M=3.0 \
+  ./prepare_inspire_lerobot2.sh convert \
+  --source /path/to/processed_raw/task \
+  --output /path/to/lerobot2/task
+```
+
+`convert_to_lerobot2.sh` validates any recorded
+`info.depth.scale_m_per_unit` by IEEE-754 float32 equality with 0.001 and writes
+the exact JSON `0.001` into converted sidecar metadata without modifying the
+source. This accepts the RealSense spelling `0.0010000000474974513` but rejects
+a physically different scale.
+
+New recordings carry `info.depth.calibration`; the converter uses that recorded
+calibration automatically for surface-normal geometry. The converted
+`meta/info.json` retains the full payload as `camera_calibration`, while
+`surface_normals_encoding.camera_calibration` carries its compact identity for
+checkpoint/live checks. The general `convert_to_lerobot2.sh` command remains
+`legacy-untagged` by default for old Dex3/unknown-camera data. The Inspire
+coordinator defaults legacy source episodes to the known replacement D435i,
+serial `254322071415`, matching the Inspire collection lineage. Override it
+explicitly only when preserving a genuinely untagged legacy lineage:
+
+```bash
+./prepare_inspire_lerobot2.sh convert \
+  --camera-calibration-profile legacy-untagged \
+  --source /path/to/legacy_processed_raw/task \
+  --output /path/to/lerobot2/untagged_task
+```
+
+Append accepts legacy-with-legacy datasets and requires matching calibration
+provenance for calibrated datasets. It rejects known-versus-unknown or differing
+camera calibrations so an append cannot silently assign calibration to old data.
+
 Check training readiness or deliberately start the three-model training and
 validation run:
 

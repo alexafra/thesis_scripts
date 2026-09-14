@@ -44,7 +44,8 @@ def _fake_environment(tmp_path: Path) -> dict[str, str]:
         converter,
         """#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$CONVERT_LOG"
+printf '%s | near=%s far=%s profile=%s\n' \
+    "$*" "$DEPTH_NEAR_M" "$DEPTH_FAR_M" "$CAMERA_CALIBRATION_PROFILE" >> "$CONVERT_LOG"
 if [[ " $* " == *" --preflight-only "* ]]; then
     exit 0
 fi
@@ -202,7 +203,32 @@ def test_convert_includes_all_137_episodes_and_builds_three_splits(tmp_path: Pat
     assert "--preflight-only" in calls[0]
     assert all("--include-surface-normals" in call for call in calls)
     assert all("--end-effector inspire-ftp" in call for call in calls)
+    assert all("--camera-calibration-profile d435i-254322071415" in call for call in calls)
+    assert all("near=0.25 far=1.0 profile=d435i-254322071415" in call for call in calls)
     assert not Path(environment["TRAIN_LOG"]).exists()
+
+
+def test_depth_range_and_calibration_profile_overrides_reach_every_conversion_call(
+    tmp_path: Path,
+) -> None:
+    environment = _fake_environment(tmp_path)
+    environment.update(
+        {
+            "DEPTH_NEAR_M": "0.3",
+            "DEPTH_FAR_M": "3.0",
+            "CAMERA_CALIBRATION_PROFILE": "legacy-untagged",
+        }
+    )
+    source = tmp_path / "processed_raw"
+    output = tmp_path / "lerobot2"
+    _make_raw(source, 10)
+
+    _run("convert", source, output, environment)
+
+    calls = Path(environment["CONVERT_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2
+    assert all("--camera-calibration-profile legacy-untagged" in call for call in calls)
+    assert all("near=0.3 far=3.0 profile=legacy-untagged" in call for call in calls)
 
 
 def test_training_check_train_and_all_are_distinct_explicit_modes(tmp_path: Path) -> None:

@@ -17,6 +17,10 @@ SPLIT_SEED="${SPLIT_SEED:-42}"
 SPLIT_SEARCH_TRIALS="${SPLIT_SEARCH_TRIALS:-20000}"
 JOBS="${JOBS:-6}"
 RUN_SUFFIX="${RUN_SUFFIX:-}"
+DEPTH_NEAR_M="${DEPTH_NEAR_M:-0.25}"
+DEPTH_FAR_M="${DEPTH_FAR_M:-1.0}"
+CAMERA_CALIBRATION_PROFILE="${CAMERA_CALIBRATION_PROFILE:-d435i-254322071415}"
+export DEPTH_NEAR_M DEPTH_FAR_M CAMERA_CALIBRATION_PROFILE
 
 CONVERT_SCRIPT="${CONVERT_SCRIPT:-$SCRIPT_DIR/convert_to_lerobot2.sh}"
 SPLIT_SCRIPT="${SPLIT_SCRIPT:-$SCRIPT_DIR/split_dataset.py}"
@@ -48,7 +52,14 @@ Options (the matching uppercase environment variable may be used instead):
   --split-search-trials N   Session-grouped search trials (default: 20000).
   --jobs N                  Video transcoding jobs (default: 6).
   --run-suffix TEXT         Training output suffix; defaults to output basename/date.
+  --camera-calibration-profile PROFILE
+                            Fallback for legacy episodes without recorded calibration:
+                            d435i-254322071415 (Inspire default) or legacy-untagged.
   -h, --help                Show this help.
+
+Depth range environment overrides:
+  DEPTH_NEAR_M              Default: 0.25.
+  DEPTH_FAR_M               Default: 1.0.
 
 The source is treated as already curated. Every direct episode_* directory is
 included; this script has no quality filter or episode-exclusion mechanism. The
@@ -171,6 +182,15 @@ while [[ $# -gt 0 ]]; do
             RUN_SUFFIX="${1#*=}"
             shift
             ;;
+        --camera-calibration-profile)
+            [[ $# -ge 2 ]] || die "--camera-calibration-profile requires a value."
+            CAMERA_CALIBRATION_PROFILE="$2"
+            shift 2
+            ;;
+        --camera-calibration-profile=*)
+            CAMERA_CALIBRATION_PROFILE="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -197,6 +217,14 @@ esac
 [[ "$SPLIT_SEARCH_TRIALS" =~ ^[1-9][0-9]*$ ]] || \
     die "--split-search-trials must be a positive integer."
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer."
+[[ -n "$CAMERA_CALIBRATION_PROFILE" ]] || \
+    die "--camera-calibration-profile must not be empty."
+case "$CAMERA_CALIBRATION_PROFILE" in
+    legacy-untagged|d435i-254322071415) ;;
+    *)
+        die "--camera-calibration-profile must be legacy-untagged or d435i-254322071415."
+        ;;
+esac
 [[ -x "$GROOT_PYTHON" ]] || die "Python is missing or not executable: $GROOT_PYTHON"
 case "$MODE" in
     check|convert|all)
@@ -276,6 +304,7 @@ raw_preflight() {
         --preflight-only \
         --include-surface-normals \
         --end-effector "$END_EFFECTOR" \
+        --camera-calibration-profile "$CAMERA_CALIBRATION_PROFILE" \
         "$SOURCE_ROOT" \
         "$REPO_ID" \
         "$JOBS"
@@ -347,6 +376,8 @@ expected_layout = {
     "right_hand": {"start": 20, "end": 26},
 }
 episode_name = re.compile(r"episode_(\d+)$")
+calibration_fingerprint = re.compile(r"sha256:[0-9a-f]{64}$")
+split_calibrations = {}
 
 
 def read_json(path):
@@ -368,6 +399,91 @@ def read_jsonl(path):
         ]
     except (OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"ERROR: cannot read {path}: {error}") from error
+
+
+def calibration_fields_signature(value, *, split, location):
+    if value["schema"] != "realsense_rgbd_calibration.v1":
+        raise SystemExit(
+            f"ERROR: {split} {location} has unsupported schema {value['schema']!r}"
+        )
+    camera = value["camera"]
+    camera_fields = {"model", "serial", "product_id", "firmware"}
+    if not isinstance(camera, dict) or set(camera) != camera_fields:
+        raise SystemExit(
+            f"ERROR: {split} {location}.camera must contain exactly "
+            "model, serial, product_id, and firmware"
+        )
+    if any(not isinstance(camera[key], str) or not camera[key].strip() for key in camera_fields):
+        raise SystemExit(
+            f"ERROR: {split} {location}.camera fields must be non-empty strings"
+        )
+    fingerprint = value["fingerprint"]
+    if not isinstance(fingerprint, str) or calibration_fingerprint.fullmatch(
+        fingerprint
+    ) is None:
+        raise SystemExit(
+            f"ERROR: {split} {location} has invalid fingerprint {fingerprint!r}"
+        )
+    return value["schema"], camera, fingerprint
+
+
+def full_calibration_signature(value, *, split):
+    expected_fields = {
+        "schema",
+        "camera",
+        "color",
+        "depth",
+        "depth_to_color",
+        "fingerprint",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise SystemExit(
+            f"ERROR: {split} camera_calibration must contain exactly "
+            "schema, camera, color, depth, depth_to_color, and fingerprint"
+        )
+    signature = calibration_fields_signature(
+        value,
+        split=split,
+        location="camera_calibration",
+    )
+    fingerprint_payload = {key: item for key, item in value.items() if key != "fingerprint"}
+    try:
+        canonical = json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise SystemExit(
+            f"ERROR: {split} camera_calibration is not finite JSON"
+        ) from error
+    expected_fingerprint = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    if value["fingerprint"] != expected_fingerprint:
+        raise SystemExit(
+            f"ERROR: {split} camera_calibration fingerprint does not match its payload"
+        )
+    return signature
+
+
+def compact_calibration_signature(value, *, split):
+    expected_fields = {"source", "schema", "camera", "fingerprint"}
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise SystemExit(
+            f"ERROR: {split} surface_normals_encoding.camera_calibration must contain "
+            "exactly source, schema, camera, and fingerprint"
+        )
+    if not isinstance(value["source"], str) or not value["source"].strip():
+        raise SystemExit(
+            f"ERROR: {split} surface_normals_encoding.camera_calibration.source "
+            "must be non-empty"
+        )
+    return calibration_fields_signature(
+        value,
+        split=split,
+        location="surface_normals_encoding.camera_calibration",
+    )
 
 
 manifest_path = root / "split_manifest.json"
@@ -512,6 +628,22 @@ for split in split_names:
     if malformed_geometry:
         raise SystemExit(f"ERROR: {split} is missing geometry metadata: {malformed_geometry}")
 
+    calibration = info.get("camera_calibration")
+    compact_calibration = info["surface_normals_encoding"].get("camera_calibration")
+    if calibration is None and compact_calibration is None:
+        split_calibrations[split] = None
+    elif calibration is None or compact_calibration is None:
+        raise SystemExit(
+            f"ERROR: {split} must carry both full and compact camera calibration"
+        )
+    else:
+        full_signature = full_calibration_signature(calibration, split=split)
+        if compact_calibration_signature(compact_calibration, split=split) != full_signature:
+            raise SystemExit(
+                f"ERROR: {split} full and compact camera calibrations do not agree"
+            )
+        split_calibrations[split] = calibration
+
     modality = read_json(split_root / "meta" / "modality.json")
     if modality.get("state") != expected_layout or modality.get("action") != expected_layout:
         raise SystemExit(f"ERROR: {split} has the wrong 26D modality layout")
@@ -549,6 +681,15 @@ for split in split_names:
         raise SystemExit(
             f"ERROR: {split} metadata/manifest frame mismatch: "
             f"{info.get('total_frames')!r} != {frames}"
+        )
+
+reference_split = split_names[0]
+reference_calibration = split_calibrations[reference_split]
+for split in split_names[1:]:
+    if split_calibrations[split] != reference_calibration:
+        raise SystemExit(
+            "ERROR: converted splits have different or known-versus-unknown "
+            f"camera calibration: {reference_split} != {split}"
         )
 
 print(
@@ -597,6 +738,7 @@ convert_dataset() {
     bash "$CONVERT_SCRIPT" \
         --include-surface-normals \
         --end-effector "$END_EFFECTOR" \
+        --camera-calibration-profile "$CAMERA_CALIBRATION_PROFILE" \
         "$BUILD_ROOT" \
         "$REPO_ID" \
         "$JOBS"

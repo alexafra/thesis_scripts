@@ -41,8 +41,10 @@ SPLIT_NAMES = ("train", "test", "validation")
 VALIDATION_ALIASES = ("validation", "validate")
 SPECIAL_STATS = ("episode_index", "index", "task_index")
 SURFACE_NORMALS_LZ4_KEY = "surface_normals_lz4"
+CAMERA_CALIBRATION_KEY = "camera_calibration"
 EPISODE_NAME = re.compile(r"^episode_(\d+)$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CALIBRATION_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class MergeError(RuntimeError):
@@ -209,6 +211,117 @@ def aligned_depth_encoding(info: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(encoding, dict):
         raise MergeError("info.json aligned_depth_encoding must be an object")
     return encoding
+
+
+def camera_calibration(info: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate full calibration and its optional surface-normal identity."""
+
+    calibration = info.get(CAMERA_CALIBRATION_KEY)
+    if calibration is not None and not isinstance(calibration, dict):
+        raise MergeError(f"info.json {CAMERA_CALIBRATION_KEY} must be an object")
+    encoding = info.get("surface_normals_encoding")
+    if encoding is not None and not isinstance(encoding, dict):
+        raise MergeError("info.json surface_normals_encoding must be an object")
+    identity = encoding.get(CAMERA_CALIBRATION_KEY) if encoding is not None else None
+    if identity is not None and not isinstance(identity, dict):
+        raise MergeError(
+            f"info.json surface_normals_encoding.{CAMERA_CALIBRATION_KEY} must be an object"
+        )
+
+    if calibration is None and identity is None:
+        return None
+    if calibration is None:
+        raise MergeError(
+            "info.json surface-normal camera identity has no full top-level "
+            f"{CAMERA_CALIBRATION_KEY}"
+        )
+    calibration_signature = _validate_full_camera_calibration(calibration)
+    if encoding is not None:
+        if identity is None:
+            raise MergeError(
+                "info.json calibrated surface-normal encoding has no compact "
+                f"{CAMERA_CALIBRATION_KEY} identity"
+            )
+        if _validate_camera_calibration_identity(identity) != calibration_signature:
+            raise MergeError(
+                "info.json full and compact camera calibrations do not agree"
+            )
+    return calibration
+
+
+def _validate_camera_fields(value: dict[str, Any], *, label: str) -> tuple[Any, Any, Any]:
+    if value["schema"] != "realsense_rgbd_calibration.v1":
+        raise MergeError(f"info.json {label} has unsupported schema {value['schema']!r}")
+    camera = value["camera"]
+    camera_fields = {"model", "serial", "product_id", "firmware"}
+    if not isinstance(camera, dict) or set(camera) != camera_fields:
+        raise MergeError(
+            f"info.json {label}.camera must contain exactly "
+            "model, serial, product_id, and firmware"
+        )
+    if any(not isinstance(camera[key], str) or not camera[key].strip() for key in camera_fields):
+        raise MergeError(f"info.json {label}.camera fields must be non-empty strings")
+    fingerprint = value["fingerprint"]
+    if not isinstance(fingerprint, str) or CALIBRATION_FINGERPRINT.fullmatch(fingerprint) is None:
+        raise MergeError(f"info.json {label} has invalid fingerprint {fingerprint!r}")
+    return value["schema"], camera, fingerprint
+
+
+def _validate_full_camera_calibration(value: dict[str, Any]) -> tuple[Any, Any, Any]:
+    expected_fields = {
+        "schema",
+        "camera",
+        "color",
+        "depth",
+        "depth_to_color",
+        "fingerprint",
+    }
+    if set(value) != expected_fields:
+        raise MergeError(
+            f"info.json {CAMERA_CALIBRATION_KEY} must contain exactly "
+            "schema, camera, color, depth, depth_to_color, and fingerprint"
+        )
+    for field in ("color", "depth", "depth_to_color"):
+        if not isinstance(value[field], dict):
+            raise MergeError(f"info.json {CAMERA_CALIBRATION_KEY}.{field} must be an object")
+    signature = _validate_camera_fields(value, label=CAMERA_CALIBRATION_KEY)
+    fingerprint_payload = {key: item for key, item in value.items() if key != "fingerprint"}
+    try:
+        canonical_json = json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise MergeError(f"info.json {CAMERA_CALIBRATION_KEY} is not finite JSON") from exc
+    expected_fingerprint = f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+    if value["fingerprint"] != expected_fingerprint:
+        raise MergeError(
+            f"info.json {CAMERA_CALIBRATION_KEY} fingerprint does not match its payload"
+        )
+    return signature
+
+
+def _validate_camera_calibration_identity(value: dict[str, Any]) -> tuple[Any, Any, Any]:
+    if set(value) != {"source", "schema", "camera", "fingerprint"}:
+        raise MergeError(
+            f"info.json {CAMERA_CALIBRATION_KEY} must contain exactly "
+            "source, schema, camera, and fingerprint"
+        )
+    if not isinstance(value["source"], str) or not value["source"].strip():
+        raise MergeError(f"info.json {CAMERA_CALIBRATION_KEY}.source must be non-empty")
+    return _validate_camera_fields(
+        value,
+        label=f"surface_normals_encoding.{CAMERA_CALIBRATION_KEY}",
+    )
+
+
+def _without_camera_calibration(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: item for key, item in value.items() if key != CAMERA_CALIBRATION_KEY}
 
 
 def surface_normals_lz4(info: dict[str, Any]) -> dict[str, Any] | None:
@@ -464,6 +577,7 @@ def validate_dataset(root: Path, *, inspect_rows: bool = True) -> dict[str, Any]
         raise MergeError(f"Episode lengths in {root} do not equal info.json total_frames")
     if int(info.get("total_tasks", -1)) != len(tasks):
         raise MergeError(f"Task count in {root} does not match info.json")
+    camera_calibration(info)
 
     raw_encoding = raw_depth_encoding(info)
     if raw_encoding is not None:
@@ -564,9 +678,12 @@ def check_compatible(destination: Path, source: Path, destination_info: dict[str
         "features",
         "depth_encoding",
         "end_effector",
-        "surface_normals_encoding",
     )
     differences = [field for field in fields if destination_info.get(field) != source_info.get(field)]
+    if _without_camera_calibration(destination_info.get("surface_normals_encoding")) != (
+        _without_camera_calibration(source_info.get("surface_normals_encoding"))
+    ):
+        differences.append("surface_normals_encoding")
     destination_raw = raw_depth_encoding(destination_info)
     source_raw = raw_depth_encoding(source_info)
     destination_raw_signature = (
@@ -599,6 +716,10 @@ def check_compatible(destination: Path, source: Path, destination_info: dict[str
     source_lz4 = surface_normals_lz4(source_info)
     if destination_lz4 != source_lz4:
         differences.append(SURFACE_NORMALS_LZ4_KEY)
+    destination_calibration = camera_calibration(destination_info)
+    source_calibration = camera_calibration(source_info)
+    if destination_calibration != source_calibration:
+        differences.append(CAMERA_CALIBRATION_KEY)
     if differences:
         raise MergeError(f"{source} is incompatible with {destination}: different {', '.join(differences)}")
     if compatibility_value(destination, "modality.json") != compatibility_value(source, "modality.json"):
@@ -922,6 +1043,12 @@ def split_provenance_records(
         split: [int(record["length"]) for record in read_jsonl(path / "meta" / "episodes.jsonl")]
         for split, path in split_dirs(root).items()
     }
+    calibration_fingerprints = {}
+    for split, path in split_dirs(root).items():
+        calibration = camera_calibration(read_json(path / "meta" / "info.json"))
+        calibration_fingerprints[split] = (
+            calibration["fingerprint"] if calibration is not None else None
+        )
     manifest_path = root / "provenance" / "merge_manifest.json"
     if not manifest_path.is_file():
         manifest_path = root / "split_manifest.json"
@@ -974,9 +1101,27 @@ def split_provenance_records(
             item = dict(indexed.get(local_index, {}))
             if "frame_count" in item and int(item["frame_count"]) != length:
                 raise MergeError(f"Episode provenance length mismatch in {manifest_path}")
+            calibration_fingerprint = calibration_fingerprints[split]
+            declared_fingerprint = item.get("camera_calibration_fingerprint")
+            if declared_fingerprint is not None:
+                if (
+                    not isinstance(declared_fingerprint, str)
+                    or CALIBRATION_FINGERPRINT.fullmatch(declared_fingerprint) is None
+                ):
+                    raise MergeError(
+                        f"Invalid camera calibration fingerprint in {manifest_path}: "
+                        f"{declared_fingerprint!r}"
+                    )
+                if declared_fingerprint != calibration_fingerprint:
+                    raise MergeError(
+                        f"Camera calibration provenance disagrees with {split} info.json "
+                        f"in {manifest_path}"
+                    )
             old_name = item.get("split_episode")
             item.setdefault("source", source_label)
             item.setdefault("source_episode_index", local_index)
+            if calibration_fingerprint is not None:
+                item["camera_calibration_fingerprint"] = calibration_fingerprint
             item.setdefault(
                 "source_split_episode",
                 old_name if isinstance(old_name, str) else f"episode_{local_index:06d}",
@@ -1021,6 +1166,23 @@ def write_split_provenance(stage: Path, records: list[dict[str, Any]]) -> None:
             raise MergeError(f"Duplicate source episode hash in split provenance: {digest}")
         seen_hashes.add(digest)
 
+    calibration_fingerprint_values = [
+        fingerprint
+        for record in records
+        if (fingerprint := record.get("camera_calibration_fingerprint")) is not None
+    ]
+    if any(
+        not isinstance(fingerprint, str)
+        or CALIBRATION_FINGERPRINT.fullmatch(fingerprint) is None
+        for fingerprint in calibration_fingerprint_values
+    ):
+        raise MergeError("Invalid camera calibration fingerprint in combined provenance")
+    camera_calibration_fingerprints = sorted(set(calibration_fingerprint_values))
+    if len(camera_calibration_fingerprints) > 1:
+        raise MergeError(
+            "Combined provenance contains different camera calibration fingerprints"
+        )
+
     split_summary = {}
     for split, path in split_dirs(stage).items():
         info = read_json(path / "meta" / "info.json")
@@ -1036,18 +1198,20 @@ def write_split_provenance(stage: Path, records: list[dict[str, Any]]) -> None:
         "splits": split_summary,
         "episodes": records,
     }
+    if camera_calibration_fingerprints:
+        manifest["camera_calibration_fingerprints"] = camera_calibration_fingerprints
     if (stage / "provenance").is_symlink():
         raise MergeError(f"Provenance directory may not be a symlink: {stage / 'provenance'}")
     atomic_write_json(stage / "provenance" / "merge_manifest.json", manifest)
-    atomic_write_json(
-        stage / "split_manifest.json",
-        {
-            "version": 1,
-            "strategy": "component-append",
-            "episode_count": len(records),
-            "episodes": records,
-        },
-    )
+    split_manifest = {
+        "version": 1,
+        "strategy": "component-append",
+        "episode_count": len(records),
+        "episodes": records,
+    }
+    if camera_calibration_fingerprints:
+        split_manifest["camera_calibration_fingerprints"] = camera_calibration_fingerprints
+    atomic_write_json(stage / "split_manifest.json", split_manifest)
 
 
 def destination_split_path(root: Path, logical_name: str) -> Path:

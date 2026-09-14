@@ -63,6 +63,44 @@ def sidecar_path(root: Path, template: str, episode_index: int, frame_index: int
     )
 
 
+def camera_calibration(serial: str = "254322071415") -> dict:
+    profile = {
+        "width": 640,
+        "height": 480,
+        "fx": 600.0,
+        "fy": 600.0,
+        "cx": 320.0,
+        "cy": 240.0,
+        "distortion": "distortion.brown_conrady",
+        "coeffs": [0.0] * 5,
+        "format": "z16",
+        "fps": 30,
+    }
+    calibration = {
+        "schema": "realsense_rgbd_calibration.v1",
+        "camera": {
+            "model": "Intel RealSense D435I",
+            "serial": serial,
+            "product_id": "0B3A",
+            "firmware": "5.15.1.55",
+        },
+        "color": {**profile, "format": "bgr8"},
+        "depth": profile,
+        "depth_to_color": {
+            "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            "translation_m": [0.015, 0.0, 0.0],
+        },
+    }
+    encoded = json.dumps(
+        calibration,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    calibration["fingerprint"] = f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    return calibration
+
+
 def make_dataset(
     root: Path,
     marker: bytes,
@@ -71,6 +109,8 @@ def make_dataset(
     aligned_total_files: int = 2,
     end_effector: dict | None = None,
     surface_normals_encoding: dict | None = None,
+    camera_calibration: dict | None = None,
+    camera_calibration_source: str = "episode.info.depth.calibration",
 ) -> None:
     length = 2
     info = {
@@ -131,7 +171,17 @@ def make_dataset(
     if end_effector is not None:
         info["end_effector"] = end_effector
     if surface_normals_encoding is not None:
-        info["surface_normals_encoding"] = surface_normals_encoding
+        info["surface_normals_encoding"] = dict(surface_normals_encoding)
+    if camera_calibration is not None:
+        info["camera_calibration"] = camera_calibration
+        info.setdefault("surface_normals_encoding", {})[
+            "camera_calibration"
+        ] = {
+            "source": camera_calibration_source,
+            "schema": camera_calibration["schema"],
+            "camera": camera_calibration["camera"],
+            "fingerprint": camera_calibration["fingerprint"],
+        }
     write_json(root / "meta" / "info.json", info)
     write_json(root / "meta" / "modality.json", {"video": {"ego_view": {}}})
     write_jsonl(root / "meta" / "tasks.jsonl", [{"task_index": 0, "task": "test task"}])
@@ -556,6 +606,105 @@ class AppendLerobot2AlignedDepthTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("different surface_normals_encoding", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
+    def test_matching_camera_calibration_is_preserved_and_added_to_provenance(self):
+        calibration = camera_calibration()
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            first = temporary / "first"
+            second = temporary / "second"
+            destination = temporary / "combined"
+            for root, marker in ((first, "first"), (second, "second")):
+                for split in ("train", "test", "validation"):
+                    make_dataset(
+                        root / split,
+                        f"{marker}-{split}".encode(),
+                        camera_calibration=calibration,
+                    )
+                make_split_manifest(root, marker)
+
+            self.run_append(destination, first, second)
+
+            for split in ("train", "test", "validation"):
+                info = json.loads((destination / split / "meta" / "info.json").read_text())
+                self.assertEqual(
+                    info["camera_calibration"],
+                    calibration,
+                )
+            provenance = json.loads(
+                (destination / "provenance" / "merge_manifest.json").read_text()
+            )
+            self.assertTrue(
+                all(
+                    record["camera_calibration_fingerprint"]
+                    == calibration["fingerprint"]
+                    for record in provenance["episodes"]
+                )
+            )
+            self.assertEqual(
+                provenance["camera_calibration_fingerprints"],
+                [calibration["fingerprint"]],
+            )
+
+    def test_known_and_unknown_camera_calibration_are_incompatible(self):
+        calibration = camera_calibration()
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(destination, b"legacy", surface_normals_encoding={})
+            make_dataset(source, b"known", camera_calibration=calibration)
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("different camera_calibration", result.stderr)
+            self.assertEqual(tree_digest(destination), destination_digest)
+
+    def test_same_camera_fingerprint_with_different_provenance_source_is_compatible(self):
+        calibration = camera_calibration()
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(destination, b"recorded", camera_calibration=calibration)
+            make_dataset(
+                source,
+                b"profile",
+                camera_calibration=calibration,
+                camera_calibration_source="converter.profile.d435i-254322071415",
+            )
+
+            result = self.run_append(destination, source)
+
+            self.assertIn("copied 1 episode(s) and 2 frame(s)", result.stdout)
+            info = json.loads((destination / "meta" / "info.json").read_text())
+            self.assertEqual(
+                info["camera_calibration"],
+                calibration,
+            )
+
+    def test_different_known_camera_calibrations_are_incompatible(self):
+        first_calibration = camera_calibration()
+        second_calibration = camera_calibration("242322076480")
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            destination = temporary / "destination"
+            source = temporary / "source"
+            make_dataset(
+                destination,
+                b"first",
+                camera_calibration=first_calibration,
+            )
+            make_dataset(source, b"second", camera_calibration=second_calibration)
+            destination_digest = tree_digest(destination)
+
+            result = self.run_append(destination, source, check=False)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("different camera_calibration", result.stderr)
             self.assertEqual(tree_digest(destination), destination_digest)
 
     def test_aligned_depth_count_and_missing_files_are_validated(self):
