@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Safety checks for the incremental Inspire LeRobot append pipeline.
 
-The shell coordinator deliberately uses hard links only while its build is
-hidden.  This helper proves the base is unchanged, detaches every surviving
-shared inode before publication, and validates split/provenance invariants.
+The shell coordinator deliberately uses hard links only while its sealed build
+is hidden.  A separate byte copy becomes the publication candidate; this
+helper proves it is complete, independent, and preserves all dataset contracts.
 """
 
 from __future__ import annotations
@@ -188,6 +188,7 @@ def _safe_provenance_relative_from_environment() -> Path:
 CHECKPOINT_COMPONENT = _safe_component_name_from_environment()
 APPEND_PROVENANCE_RELATIVE = _safe_provenance_relative_from_environment()
 CHECKPOINT_BUILD = "final_build"
+CHECKPOINT_PUBLISH_BUILD = "publish_build"
 CHECKPOINT_SNAPSHOTS = {
     "base": "provenance/base_tree_snapshot.json",
     "source": "provenance/source_tree_snapshot.json",
@@ -198,7 +199,7 @@ BUILD_CHECKPOINT_SNAPSHOTS = {
     "source": "provenance/source_tree_snapshot.json",
     "build": "provenance/build_tree_snapshot.json",
 }
-PUBLISHED_TREE_SNAPSHOT = "provenance/published_tree_snapshot.json"
+PUBLISHED_COPY_REPORT = "provenance/publish_build_inventory.json"
 
 
 def _validated_snapshot_summary(path: Path) -> dict[str, Any]:
@@ -367,13 +368,18 @@ def _checkpoint_state(root: Path) -> dict[str, Any]:
         ):
             raise AppendSafetyError("Build checkpoint state is malformed")
     else:
-        expected = common | {"build_relative_path", "published_snapshot"}
+        expected = common | {
+            "build_relative_path",
+            "publish_build_relative_path",
+            "published_inventory",
+        }
         if (
             set(state) != expected
             or state.get("build_relative_path") != CHECKPOINT_BUILD
+            or state.get("publish_build_relative_path") != CHECKPOINT_PUBLISH_BUILD
             or not isinstance(state.get("snapshots"), dict)
             or set(state["snapshots"]) != set(BUILD_CHECKPOINT_SNAPSHOTS)
-            or not isinstance(state.get("published_snapshot"), dict)
+            or not isinstance(state.get("published_inventory"), dict)
         ):
             raise AppendSafetyError("Publish-ready checkpoint state is malformed")
     if not isinstance(state.get("base_path"), str) or not isinstance(
@@ -419,18 +425,25 @@ def normalize_checkpoint(root: Path) -> None:
         allowed = {
             CHECKPOINT_COMPONENT,
             CHECKPOINT_BUILD,
+            CHECKPOINT_PUBLISH_BUILD,
             "provenance",
             CHECKPOINT_STATE,
         }
     else:
-        # publish_ready is already byte-sealed. A retry must not remove its
-        # detach report or any other file covered by the published snapshot.
-        allowed = {CHECKPOINT_BUILD, "provenance", CHECKPOINT_STATE}
+        # publish_ready is already sealed. A retry must not mutate either the
+        # source build or its independently copied publication candidate.
+        allowed = {
+            CHECKPOINT_COMPONENT,
+            CHECKPOINT_BUILD,
+            CHECKPOINT_PUBLISH_BUILD,
+            "provenance",
+            CHECKPOINT_STATE,
+        }
     actual = {path.name for path in root.iterdir()}
     required = (
         {CHECKPOINT_COMPONENT, "provenance", CHECKPOINT_STATE}
         if phase == CHECKPOINT_PHASE
-        else {CHECKPOINT_BUILD, "provenance", CHECKPOINT_STATE}
+        else {CHECKPOINT_COMPONENT, CHECKPOINT_BUILD, "provenance", CHECKPOINT_STATE}
     )
     if not required.issubset(actual) or not actual.issubset(allowed):
         raise AppendSafetyError(
@@ -440,7 +453,7 @@ def normalize_checkpoint(root: Path) -> None:
 
 
 def write_publish_ready_checkpoint(root: Path, base: Path, source: Path) -> None:
-    """Seal the exact detached tree immediately before its no-replace publication."""
+    """Seal the independent bulk-copy candidate before no-replace publication."""
 
     root = root.expanduser().resolve()
     base = base.expanduser().resolve()
@@ -450,20 +463,28 @@ def write_publish_ready_checkpoint(root: Path, base: Path, source: Path) -> None
         raise AppendSafetyError(
             "Only a final-build-ready checkpoint may advance to publish-ready"
         )
-    validate_retired_build_checkpoint(root, base, source)
-    build = root / CHECKPOINT_BUILD
-    published_path = root / PUBLISHED_TREE_SNAPSHOT
-    published = _validated_snapshot_summary(published_path)
-    actual = tree_summary(build)
-    actual_summary = {
-        key: actual[key] for key in ("file_count", "total_bytes", "tree_sha256")
-    }
-    if published != actual_summary:
-        raise AppendSafetyError("Published-candidate snapshot does not match final build")
+    if prior.get("base_path") != str(base) or prior.get("source_path") != str(source):
+        raise AppendSafetyError("Checkpoint belongs to different base or source trees")
+    build = root / CHECKPOINT_PUBLISH_BUILD
+    sealed_build = root / CHECKPOINT_BUILD
+    component = root / CHECKPOINT_COMPONENT
+    if not component.is_dir() or component.is_symlink():
+        raise AppendSafetyError(f"Sealed converted component is missing: {component}")
+    if not sealed_build.is_dir() or sealed_build.is_symlink():
+        raise AppendSafetyError(f"Sealed source build is missing: {sealed_build}")
+    if not build.is_dir() or build.is_symlink():
+        raise AppendSafetyError(f"Independent publication candidate is missing: {build}")
+    published = validate_independent_copy(
+        root / CHECKPOINT_BUILD,
+        build,
+        report=root / PUBLISHED_COPY_REPORT,
+        read_only=True,
+    )
     state = {
         **prior,
         "phase": "publish_ready",
-        "published_snapshot": published,
+        "publish_build_relative_path": CHECKPOINT_PUBLISH_BUILD,
+        "published_inventory": published,
     }
     _atomic_json(root / CHECKPOINT_STATE, state)
     print(f"Sealed publish-ready checkpoint: {root}")
@@ -475,7 +496,7 @@ def _validate_publish_ready_common(
     source: Path,
     published_tree: Path,
     *,
-    build_present: bool,
+    publish_build_present: bool,
 ) -> None:
     root = root.expanduser().resolve()
     base = base.expanduser().resolve()
@@ -486,11 +507,17 @@ def _validate_publish_ready_common(
         raise AppendSafetyError("Checkpoint is not sealed publish-ready")
     if state.get("base_path") != str(base) or state.get("source_path") != str(source):
         raise AppendSafetyError("Publish-ready checkpoint belongs to different inputs")
-    if (root / CHECKPOINT_COMPONENT).exists() or (root / CHECKPOINT_COMPONENT).is_symlink():
-        raise AppendSafetyError("Publish-ready checkpoint still contains its component")
-    expected_entries = {"provenance", CHECKPOINT_STATE}
-    if build_present:
-        expected_entries.add(CHECKPOINT_BUILD)
+    component = root / CHECKPOINT_COMPONENT
+    if not component.is_dir() or component.is_symlink():
+        raise AppendSafetyError(f"Sealed converted component is missing: {component}")
+    expected_entries = {
+        CHECKPOINT_COMPONENT,
+        CHECKPOINT_BUILD,
+        "provenance",
+        CHECKPOINT_STATE,
+    }
+    if publish_build_present:
+        expected_entries.add(CHECKPOINT_PUBLISH_BUILD)
     if {path.name for path in root.iterdir()} != expected_entries:
         raise AppendSafetyError("Publish-ready checkpoint contains unexpected entries")
     for name in ("base", "source"):
@@ -500,28 +527,25 @@ def _validate_publish_ready_common(
             raise AppendSafetyError(
                 f"Publish-ready {name} snapshot does not match sealed state"
             )
-        verify_tree_snapshot({"base": base, "source": source}[name], snapshot_path)
     build_snapshot = _validated_snapshot_summary(
         root / BUILD_CHECKPOINT_SNAPSHOTS["build"]
     )
     if build_snapshot != state["snapshots"]["build"]:
         raise AppendSafetyError("Pre-detach build snapshot does not match sealed state")
-    published_snapshot = _validated_snapshot_summary(root / PUBLISHED_TREE_SNAPSHOT)
-    if published_snapshot != state["published_snapshot"]:
-        raise AppendSafetyError("Published snapshot does not match sealed state")
-    actual = tree_summary(published_tree)
-    for key in ("file_count", "total_bytes", "tree_sha256"):
-        if actual[key] != published_snapshot[key]:
-            raise AppendSafetyError(
-                f"Published tree mismatch: {key}={actual[key]!r}, "
-                f"expected {published_snapshot[key]!r}"
-            )
+    published = validate_independent_copy(
+        root / CHECKPOINT_BUILD,
+        published_tree,
+        report=root / PUBLISHED_COPY_REPORT,
+        read_only=True,
+    )
+    if published != state["published_inventory"]:
+        raise AppendSafetyError("Published inventory does not match sealed state")
 
 
 def validate_publish_ready_checkpoint(root: Path, base: Path, source: Path) -> None:
-    build = root.expanduser().resolve() / CHECKPOINT_BUILD
+    build = root.expanduser().resolve() / CHECKPOINT_PUBLISH_BUILD
     _validate_publish_ready_common(
-        root, base, source, build, build_present=True
+        root, base, source, build, publish_build_present=True
     )
     print(f"Validated publish-ready checkpoint: {root}")
 
@@ -532,7 +556,7 @@ def validate_published_target_checkpoint(
     if not target.expanduser().resolve().is_dir() or target.is_symlink():
         raise AppendSafetyError(f"Published target is not a real directory: {target}")
     _validate_publish_ready_common(
-        root, base, source, target, build_present=False
+        root, base, source, target, publish_build_present=False
     )
     print(f"Validated published target left before checkpoint cleanup: {target}")
 
@@ -634,11 +658,19 @@ def validate_retired_build_checkpoint(root: Path, base: Path, source: Path) -> N
         raise AppendSafetyError("Checkpoint belongs to a different base or source tree")
     if (root / CHECKPOINT_COMPONENT).exists() or (root / CHECKPOINT_COMPONENT).is_symlink():
         raise AppendSafetyError("Converted component was not fully retired")
-    if {path.name for path in root.iterdir()} != {
+    expected_entries = {
         CHECKPOINT_BUILD,
         "provenance",
         CHECKPOINT_STATE,
-    }:
+    }
+    publish_build = root / CHECKPOINT_PUBLISH_BUILD
+    if publish_build.exists() or publish_build.is_symlink():
+        if not publish_build.is_dir() or publish_build.is_symlink():
+            raise AppendSafetyError(
+                f"Publication candidate is not a real directory: {publish_build}"
+            )
+        expected_entries.add(CHECKPOINT_PUBLISH_BUILD)
+    if {path.name for path in root.iterdir()} != expected_entries:
         raise AppendSafetyError("Retired build checkpoint contains unexpected entries")
 
     roots = {"base": base, "source": source, "build": root / CHECKPOINT_BUILD}
@@ -1160,6 +1192,79 @@ def _same_inode(left: Path, right: Path) -> bool:
     left_stat = left.stat()
     right_stat = right.stat()
     return left_stat.st_dev == right_stat.st_dev and left_stat.st_ino == right_stat.st_ino
+
+
+def validate_independent_copy(
+    source: Path,
+    output: Path,
+    *,
+    report: Path,
+    read_only: bool = False,
+) -> dict[str, Any]:
+    """Prove a bulk copy has the same file inventory and no shared inodes.
+
+    The sealed source already has a byte-level tree SHA-256. GNU cp is required
+    to return success with reflinks and hard-link preservation disabled; this
+    deliberately performs only a fast path/size/inode audit.
+    """
+
+    source = source.expanduser().resolve()
+    output = output.expanduser().resolve()
+    if source == output or source in output.parents or output in source.parents:
+        raise AppendSafetyError("Bulk-copy source and output paths may not overlap")
+    source_files = {
+        path.relative_to(source): path for path in _regular_files(source)
+    }
+    output_files = {
+        path.relative_to(output): path for path in _regular_files(output)
+    }
+    if set(source_files) != set(output_files):
+        missing = sorted(str(path) for path in set(source_files) - set(output_files))
+        extra = sorted(str(path) for path in set(output_files) - set(source_files))
+        raise AppendSafetyError(
+            "Bulk-copy file inventory differs from sealed build: "
+            f"missing={missing[:1]!r}, extra={extra[:1]!r}"
+        )
+    shared = []
+    inventory = hashlib.sha256()
+    total_bytes = 0
+    for relative, source_path in source_files.items():
+        output_path = output_files[relative]
+        source_size = source_path.stat().st_size
+        if source_size != output_path.stat().st_size:
+            raise AppendSafetyError(f"Bulk-copy size mismatch: {relative}")
+        if _same_inode(source_path, output_path):
+            shared.append(relative.as_posix())
+        inventory.update(relative.as_posix().encode("utf-8"))
+        inventory.update(b"\0")
+        inventory.update(str(source_size).encode("ascii"))
+        inventory.update(b"\0")
+        total_bytes += source_size
+    if shared:
+        raise AppendSafetyError(
+            f"Bulk-copy candidate shares {len(shared)} source files; first={shared[0]}"
+        )
+    result = {
+        "version": 1,
+        "copy_command_contract": "cp --archive --reflink=never --no-preserve=links",
+        "file_count": len(source_files),
+        "total_bytes": total_bytes,
+        "path_size_inventory_sha256": inventory.hexdigest(),
+        "shared_source_inodes": 0,
+    }
+    report = report.expanduser().resolve()
+    if read_only:
+        if _read_json(report) != result:
+            raise AppendSafetyError(
+                f"Bulk-copy inventory report is stale or invalid: {report}"
+            )
+    else:
+        _atomic_json(report, result)
+    print(
+        f"Independent bulk copy validated: {len(source_files)} regular files, "
+        "shared source inodes=0"
+    )
+    return result
 
 
 def _is_payload(relative: Path) -> bool:
@@ -1730,6 +1835,12 @@ def parse_args() -> argparse.Namespace:
     detach.add_argument("--snapshot", type=Path, required=True)
     detach.add_argument("--report", type=Path, required=True)
 
+    independent_copy = commands.add_parser("validate-independent-copy")
+    independent_copy.add_argument("--source", type=Path, required=True)
+    independent_copy.add_argument("--output", type=Path, required=True)
+    independent_copy.add_argument("--report", type=Path, required=True)
+    independent_copy.add_argument("--read-only", action="store_true")
+
     publish = commands.add_parser("publish-no-replace")
     publish.add_argument("--build", type=Path, required=True)
     publish.add_argument("--target", type=Path, required=True)
@@ -1815,6 +1926,13 @@ def main() -> int:
         )
     elif args.command == "detach-and-verify":
         detach_and_verify(args.base, args.output, args.snapshot, args.report)
+    elif args.command == "validate-independent-copy":
+        validate_independent_copy(
+            args.source,
+            args.output,
+            report=args.report,
+            read_only=args.read_only,
+        )
     elif args.command == "publish-no-replace":
         publish_no_replace(args.build, args.target)
     elif args.command == "validate-final":

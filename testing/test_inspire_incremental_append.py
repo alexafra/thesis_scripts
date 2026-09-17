@@ -247,6 +247,17 @@ elif command == "publish-no-replace":
         converter,
         "#!/usr/bin/env bash\nprintf '%s\\n' \"convert $*\" >> \"$FAKE_LOG\"\n",
     )
+    copy_tool = tmp_path / "copy.py"
+    write_executable(
+        copy_tool,
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport os,shutil,sys\n"
+        "source=Path(sys.argv[-2]).resolve(); output=Path(sys.argv[-1]).resolve()\n"
+        "with open(os.environ['FAKE_LOG'],'a',encoding='utf-8') as h: h.write(f'copy {source} {output}\\n')\n"
+        "marker=Path(os.environ['FAIL_MARKER'])\n"
+        "if os.environ.get('FAIL_DETACH_ONCE') == '1' and not marker.exists():\n"
+        " marker.write_text('failed once\\n',encoding='utf-8'); (output/'partial.marker').write_text('keep\\n',encoding='utf-8'); raise SystemExit(71)\n"
+        "shutil.copytree(source,output,dirs_exist_ok=True,copy_function=shutil.copy2)\n",
+    )
     appender = tmp_path / "append.py"
     write_executable(
         appender,
@@ -289,6 +300,7 @@ elif command == "publish-no-replace":
         "GROOT_PYTHON": sys.executable,
         "UNITREE_PYTHON": sys.executable,
         "CONVERT_SCRIPT": str(converter),
+        "COPY_TOOL": str(copy_tool),
         "SPLIT_SCRIPT": str(splitter),
         "APPEND_SCRIPT": str(appender),
         "SUPPORT_SCRIPT": str(support),
@@ -926,30 +938,25 @@ def test_build_retires_component_after_seal_then_cleans_after_publish(
         / "incremental_append_generations"
         / "20260917_cup_pyramid_and_toothpaste_09_16"
     )
-    assert (generation / "detach_report.json").is_file()
+    assert not (generation / "detach_report.json").exists()
     assert (generation / "append_manifest.json").is_file()
     assert (
         paths["target"] / "provenance" / "incremental_append" / "legacy.txt"
     ).read_bytes() == b"sealed-655-provenance\n"
 
     calls = paths["log"].read_text(encoding="utf-8").splitlines()
-    detach_index = next(index for index, line in enumerate(calls) if "support detach-and-verify" in line)
+    copy_index = next(index for index, line in enumerate(calls) if line.startswith("copy "))
+    inventory_index = next(
+        index
+        for index, line in enumerate(calls)
+        if "support validate-independent-copy" in line
+    )
     final_validate_indices = [
         index for index, line in enumerate(calls) if "support validate-final" in line
     ]
-    fresh_base_verify = next(
-        index
-        for index, line in enumerate(calls)
-        if index > detach_index and "support verify-tree-snapshot" in line and str(paths["base"]) in line
-    )
-    assert final_validate_indices[0] < detach_index < fresh_base_verify < final_validate_indices[-1]
+    assert final_validate_indices[0] < copy_index < inventory_index < final_validate_indices[-1]
     assert "--require-independent" in calls[final_validate_indices[-1]]
-    retire_index = next(
-        index
-        for index, line in enumerate(calls)
-        if "support retire-component-after-build" in line
-    )
-    assert retire_index < detach_index
+    assert not any("support retire-component-after-build" in line for line in calls)
     assert "--episodes 46 6 6" in calls[final_validate_indices[-1]]
     assert "--frames 35383 5540 4196" in calls[final_validate_indices[-1]]
     assert "Final population: train=571/231836, validation=71/28259, test=71/28762" in result.stdout
@@ -970,7 +977,7 @@ def test_build_retires_component_after_seal_then_cleans_after_publish(
     assert f"{paths['build']}/test" not in stats_call
 
 
-def test_detach_failure_retains_sealed_final_build_after_component_retirement(
+def test_bulk_copy_failure_preserves_partial_and_sealed_source_fail_closed(
     tmp_path: Path,
 ) -> None:
     environment, paths = fake_pipeline_environment(tmp_path, fail_detach_once=True)
@@ -985,9 +992,10 @@ def test_detach_failure_retains_sealed_final_build_after_component_retirement(
 
     assert result.returncode == 71
     assert not paths["target"].exists()
-    assert not (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").exists()
+    assert (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").is_dir()
     assert (paths["checkpoint"] / "final_build").is_dir()
     assert (paths["checkpoint"] / "final_build" / "appended.marker").is_file()
+    assert (paths["checkpoint"] / "publish_build" / "partial.marker").is_file()
 
     resumed = subprocess.run(
         ["bash", str(PIPELINE), "build"],
@@ -996,8 +1004,12 @@ def test_detach_failure_retains_sealed_final_build_after_component_retirement(
         capture_output=True,
         text=True,
     )
-    assert resumed.returncode == 0, resumed.stderr
-    assert paths["target"].is_dir()
+    assert resumed.returncode != 0
+    assert "Partial publication copy was preserved" in resumed.stdout
+    assert not paths["target"].exists()
+    calls = paths["log"].read_text(encoding="utf-8").splitlines()
+    assert len([line for line in calls if line.startswith("append ")]) == 1
+    assert len([line for line in calls if line.startswith("copy ")]) == 1
 
 
 def test_crash_after_final_build_move_rolls_forward_without_deleting_payload(
@@ -1102,7 +1114,8 @@ def test_target_created_at_publish_boundary_is_never_replaced(tmp_path: Path) ->
     assert (paths["target"] / "racer.txt").read_text(encoding="utf-8") == "must survive\n"
     assert not paths["work"].exists()
     assert not paths["build"].exists()
-    assert not (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").exists()
+    assert (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").is_dir()
     assert (paths["checkpoint"] / "final_build").is_dir()
+    assert (paths["checkpoint"] / "publish_build").is_dir()
     calls = paths["log"].read_text(encoding="utf-8")
     assert "support publish-no-replace" in calls

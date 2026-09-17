@@ -62,6 +62,7 @@ BUILD_DATASET="$DATASET_PARENT/.${TARGET_NAME}.build-${RUN_ID}"
 CHECKPOINT_ROOT="$DATASET_PARENT/.${TARGET_NAME}.resume-checkpoint"
 CHECKPOINT_COMPONENT="$CHECKPOINT_ROOT/$COMPONENT_NAME"
 CHECKPOINT_BUILD="$CHECKPOINT_ROOT/final_build"
+CHECKPOINT_PUBLISH_BUILD="$CHECKPOINT_ROOT/publish_build"
 CHECKPOINT_PROVENANCE="$CHECKPOINT_ROOT/provenance"
 CHECKPOINT_SOURCE_BUNDLE="$CHECKPOINT_PROVENANCE/source_bundle"
 CHECKPOINT_APPEND_PROVENANCE="$CHECKPOINT_BUILD/$APPEND_PROVENANCE_RELATIVE"
@@ -69,8 +70,9 @@ LOG_ROOT="${LOG_ROOT:-/home/alex/Development/logs}"
 PIPELINE_LOG="${PIPELINE_LOG:-$LOG_ROOT/data_pipeline/inspire_toothpaste_pyramid_0916_append_${RUN_ID}.log}"
 LOCK_FILE="${LOCK_FILE:-$LOG_ROOT/data_pipeline/.inspire_incremental_append.lock}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-360}"
-DETACH_HEADROOM_GIB="${DETACH_HEADROOM_GIB:-32}"
+BULK_COPY_HEADROOM_GIB="${BULK_COPY_HEADROOM_GIB:-${DETACH_HEADROOM_GIB:-32}}"
 JOBS="${JOBS:-6}"
+COPY_TOOL="${COPY_TOOL:-cp}"
 
 CONVERT_SCRIPT="${CONVERT_SCRIPT:-$SCRIPTS_DIR/convert_to_lerobot2.sh}"
 SPLIT_SCRIPT="${SPLIT_SCRIPT:-$SCRIPTS_DIR/split_dataset.py}"
@@ -138,8 +140,9 @@ require_tools() {
     command -v "$UV" >/dev/null 2>&1 || die "uv is required for exact GR00T statistics"
     [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "JOBS must be a positive integer"
     [[ "$MIN_FREE_GIB" =~ ^[1-9][0-9]*$ ]] || die "MIN_FREE_GIB must be positive"
-    [[ "$DETACH_HEADROOM_GIB" =~ ^[1-9][0-9]*$ ]] || \
-        die "DETACH_HEADROOM_GIB must be positive"
+    [[ "$BULK_COPY_HEADROOM_GIB" =~ ^[1-9][0-9]*$ ]] || \
+        die "BULK_COPY_HEADROOM_GIB must be positive"
+    command -v "$COPY_TOOL" >/dev/null 2>&1 || die "cp-compatible COPY_TOOL is required"
 }
 
 require_quiescent_writers() {
@@ -217,17 +220,19 @@ require_free_gib() {
         "$((available_kib / 1024 / 1024))" "$required_gib"
 }
 
-require_detach_space() {
-    local available_kib base_kib required_kib required_gib
+require_bulk_copy_space() {
+    local available_kib source_kib required_kib required_gib
+    [[ -d "$CHECKPOINT_BUILD" && ! -L "$CHECKPOINT_BUILD" ]] || \
+        die "Sealed final build is missing before bulk-copy disk preflight"
     available_kib="$(df -Pk "$DATASET_PARENT" | awk 'NR == 2 {print $4}')"
-    base_kib="$(du -sk -- "$BASE_DATASET" | awk '{print $1}')"
-    required_kib=$((base_kib + DETACH_HEADROOM_GIB * 1024 * 1024))
+    source_kib="$(du -sk --apparent-size -- "$CHECKPOINT_BUILD" | awk '{print $1}')"
+    required_kib=$((source_kib + BULK_COPY_HEADROOM_GIB * 1024 * 1024))
     required_gib=$(((required_kib + 1024 * 1024 - 1) / (1024 * 1024)))
     if (( available_kib < required_kib )); then
-        die "Detaching the base requires ${required_gib} GiB free (allocated base plus ${DETACH_HEADROOM_GIB} GiB headroom); only $((available_kib / 1024 / 1024)) GiB is available"
+        die "Independent bulk copy requires ${required_gib} GiB free (full candidate plus ${BULK_COPY_HEADROOM_GIB} GiB headroom); only $((available_kib / 1024 / 1024)) GiB is available"
     fi
-    printf 'Detach disk preflight: %d GiB free (minimum %d GiB: allocated base plus %d GiB headroom).\n' \
-        "$((available_kib / 1024 / 1024))" "$required_gib" "$DETACH_HEADROOM_GIB"
+    printf 'Bulk-copy disk preflight: %d GiB free (minimum %d GiB including %d GiB headroom).\n' \
+        "$((available_kib / 1024 / 1024))" "$required_gib" "$BULK_COPY_HEADROOM_GIB"
 }
 
 adopt_orphan_final_build() {
@@ -268,8 +273,10 @@ recover_published_target() {
         die "Existing target is not a real directory: $TARGET_DATASET"
     [[ -d "$CHECKPOINT_ROOT" && ! -L "$CHECKPOINT_ROOT" ]] || \
         die "Final target exists without its sealed cleanup checkpoint; preserving it for inspection"
-    [[ ! -e "$CHECKPOINT_BUILD" && ! -L "$CHECKPOINT_BUILD" ]] || \
-        die "Both final target and checkpoint build exist; refusing ambiguous recovery"
+    [[ -d "$CHECKPOINT_BUILD" && ! -L "$CHECKPOINT_BUILD" ]] || \
+        die "Published target recovery requires its retained sealed source build"
+    [[ ! -e "$CHECKPOINT_PUBLISH_BUILD" && ! -L "$CHECKPOINT_PUBLISH_BUILD" ]] || \
+        die "Both final target and publication candidate exist; refusing ambiguous recovery"
     local phase
     phase="$($UNITREE_PYTHON "$SUPPORT_SCRIPT" checkpoint-phase --root "$CHECKPOINT_ROOT")"
     [[ "$phase" == publish_ready ]] || \
@@ -320,12 +327,7 @@ build_dataset() {
             --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
             --source "$CHECKPOINT_SOURCE_BUNDLE"
     elif [[ "$checkpoint_phase_value" == final_build_ready ]]; then
-        # The sealed build already owns hard links to every retained component
-        # payload, so the component can now be retired before base detachment.
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" retire-component-after-build \
-            --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
-            --source "$CHECKPOINT_SOURCE_BUNDLE"
-        require_detach_space
+        printf '[resume] Reusing the sealed final build; conversion, append, and stats remain skipped.\n'
     else
         require_free_gib "$MIN_FREE_GIB"
     fi
@@ -394,8 +396,6 @@ build_dataset() {
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
             --root "$CHECKPOINT_COMPONENT" \
             --component cup_pyramid_09_16 --component toothpaste_09_16
-        require_detach_space
-
         printf '[reuse] Hard-linking the immutable base into a hidden build only.\n'
         [[ "$(stat -c %d "$BASE_DATASET")" == "$(stat -c %d "$DATASET_PARENT")" ]] || \
             die "Base and build parent must be on the same filesystem"
@@ -456,37 +456,30 @@ build_dataset() {
     fi
 
     if [[ "$checkpoint_phase_value" == final_build_ready ]]; then
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" retire-component-after-build \
-            --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
-            --source "$CHECKPOINT_SOURCE_BUNDLE"
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-retired-build-checkpoint \
-            --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
-            --source "$CHECKPOINT_SOURCE_BUNDLE"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-final \
             --base "$BASE_DATASET" --output "$CHECKPOINT_BUILD" \
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-training-stats \
             --dataset-root "$CHECKPOINT_BUILD" --expected-frames "${FINAL_FRAMES[0]}" \
             --report "$CHECKPOINT_APPEND_PROVENANCE/stats_finalization_report.json"
-        require_detach_space
+        require_bulk_copy_space
+        [[ ! -e "$CHECKPOINT_PUBLISH_BUILD" && ! -L "$CHECKPOINT_PUBLISH_BUILD" ]] || \
+            die "Partial publication copy was preserved; inspect it before retry: $CHECKPOINT_PUBLISH_BUILD"
 
-        printf '[detach] Making every retained base file physically independent before publication.\n'
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" detach-and-verify \
-            --base "$BASE_DATASET" --output "$CHECKPOINT_BUILD" \
-            --snapshot "$CHECKPOINT_APPEND_PROVENANCE/base_tree_snapshot.json" \
-            --report "$CHECKPOINT_APPEND_PROVENANCE/detach_report.json"
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-            --root "$BASE_DATASET" \
-            --snapshot "$CHECKPOINT_APPEND_PROVENANCE/base_tree_snapshot.json"
+        printf '[copy] Deep-copying the sealed build with hard links and reflinks disabled.\n'
+        mkdir -- "$CHECKPOINT_PUBLISH_BUILD"
+        "$COPY_TOOL" --archive --reflink=never --no-preserve=links -- \
+            "$CHECKPOINT_BUILD/." "$CHECKPOINT_PUBLISH_BUILD/"
+        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-independent-copy \
+            --source "$CHECKPOINT_BUILD" --output "$CHECKPOINT_PUBLISH_BUILD" \
+            --report "$CHECKPOINT_PROVENANCE/publish_build_inventory.json"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-final \
-            --base "$BASE_DATASET" --output "$CHECKPOINT_BUILD" --require-independent \
+            --base "$BASE_DATASET" --output "$CHECKPOINT_PUBLISH_BUILD" --require-independent \
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-training-stats \
-            --dataset-root "$CHECKPOINT_BUILD" --expected-frames "${FINAL_FRAMES[0]}" \
-            --report "$CHECKPOINT_APPEND_PROVENANCE/stats_finalization_report.json"
-        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
-            --root "$CHECKPOINT_BUILD" \
-            --output "$CHECKPOINT_PROVENANCE/published_tree_snapshot.json"
+            --dataset-root "$CHECKPOINT_PUBLISH_BUILD" --expected-frames "${FINAL_FRAMES[0]}" \
+            --report "$CHECKPOINT_PUBLISH_BUILD/$APPEND_PROVENANCE_RELATIVE/stats_finalization_report.json" \
+            --read-only
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" write-publish-ready-checkpoint \
             --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
             --source "$CHECKPOINT_SOURCE_BUNDLE"
@@ -500,9 +493,8 @@ build_dataset() {
         --source "$CHECKPOINT_SOURCE_BUNDLE"
 
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" publish-no-replace \
-        --build "$CHECKPOINT_BUILD" --target "$TARGET_DATASET"
-    safe_remove_checkpoint "$CHECKPOINT_ROOT"
-    printf 'DATASET_PUBLISHED=%s\n' "$TARGET_DATASET"
+        --build "$CHECKPOINT_PUBLISH_BUILD" --target "$TARGET_DATASET"
+    recover_published_target
     printf 'Final population: train=%d/%d, validation=%d/%d, test=%d/%d\n' \
         "${FINAL_EPISODES[0]}" "${FINAL_FRAMES[0]}" \
         "${FINAL_EPISODES[1]}" "${FINAL_FRAMES[1]}" \
