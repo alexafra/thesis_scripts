@@ -17,6 +17,7 @@ usage() {
     cat <<'EOF'
 Usage:
   convert_to_lerobot2.sh [--color-only] [--include-surface-normals] \
+      [--surface-normals-encoding-version {1,2}] \
       [--preflight-only] \
       [--end-effector TYPE] \
       [--camera-calibration-profile PROFILE] \
@@ -41,7 +42,7 @@ Arguments:
   PATH/TO/INPUT_COPY  Disposable direct-episode or split-parent dataset copy.
   REPO_ID             Base local dataset identifier. Defaults to the input folder
                       name. Split mode adds _train, _validation, or _test.
-  JOBS                H.264 transcoding jobs. Defaults to 6.
+  JOBS                H.264/LZ4 post-processing jobs. Defaults to 6.
 
 Options:
   --end-effector TYPE  Raw hand contract: dex3 (default), inspire-dfx, or
@@ -49,6 +50,9 @@ Options:
                       never padded to the 28D Dex3 layout.
   --include-surface-normals
                       Add surface_normals_view and its lossless LZ4 sidecar.
+  --surface-normals-encoding-version {1,2}
+                      Surface-normal pixel contract. Default: 2 (depth-range
+                      masked). Use 1 only to reproduce a legacy v1 dataset.
   --color-only         Convert only color_0. This is an explicit opt-in for
                       recordings with no depth; normal RGB-D behavior remains
                       the default. It cannot be combined with surface normals.
@@ -66,10 +70,17 @@ Environment overrides:
   DEPTH_NEAR_M          Default: 0.25
   DEPTH_FAR_M           Default: 1.0
   CAMERA_CALIBRATION_PROFILE
-                        Default: legacy-untagged. Recorded episode calibration
-                        takes precedence inside the Unitree converter.
+                        Default: legacy-untagged. Fully tagged data uses its
+                        recorded calibration. A tagged/legacy mix requires an
+                        explicit profile exactly matching every recorded value.
   INCLUDE_SURFACE_NORMALS
                         Default: 0. Set to 1 to add surface_normals_view.
+  SURFACE_NORMALS_ENCODING_VERSION
+                        Default: 2. Version 1 is the legacy unmasked transform.
+  DEPTH_PROCESSING_WORKERS
+                        Parallel ordered depth/normal frame workers. Default: 8.
+  VIDEO_ENCODING_WORKERS
+                        Concurrent per-episode modality encoders. Default: 3.
 EOF
 }
 
@@ -79,6 +90,7 @@ die() {
 }
 
 INCLUDE_SURFACE_NORMALS="${INCLUDE_SURFACE_NORMALS:-0}"
+SURFACE_NORMALS_ENCODING_VERSION="${SURFACE_NORMALS_ENCODING_VERSION:-2}"
 COLOR_ONLY=0
 END_EFFECTOR="dex3"
 CAMERA_CALIBRATION_PROFILE="${CAMERA_CALIBRATION_PROFILE:-legacy-untagged}"
@@ -89,6 +101,15 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --include-surface-normals)
             INCLUDE_SURFACE_NORMALS=1
+            shift
+            ;;
+        --surface-normals-encoding-version)
+            [[ $# -ge 2 ]] || die "--surface-normals-encoding-version requires 1 or 2."
+            SURFACE_NORMALS_ENCODING_VERSION="$2"
+            shift 2
+            ;;
+        --surface-normals-encoding-version=*)
+            SURFACE_NORMALS_ENCODING_VERSION="${1#*=}"
             shift
             ;;
         --color-only)
@@ -168,8 +189,16 @@ ISAAC_GROOT_REPO="${ISAAC_GROOT_REPO:-$HOME/Development/Isaac-GR00T}"
 UNITREE_PYTHON="${UNITREE_PYTHON:-$HOME/miniconda3/envs/unitree_lerobot/bin/python}"
 DEPTH_NEAR_M="${DEPTH_NEAR_M:-0.25}"
 DEPTH_FAR_M="${DEPTH_FAR_M:-1.0}"
+DEPTH_PROCESSING_WORKERS="${DEPTH_PROCESSING_WORKERS:-8}"
+VIDEO_ENCODING_WORKERS="${VIDEO_ENCODING_WORKERS:-3}"
 export DEPTH_NEAR_M DEPTH_FAR_M
+export DEPTH_PROCESSING_WORKERS VIDEO_ENCODING_WORKERS
 export CAMERA_CALIBRATION_PROFILE
+
+[[ "$DEPTH_PROCESSING_WORKERS" =~ ^[1-9][0-9]*$ ]] || \
+    die "DEPTH_PROCESSING_WORKERS must be a positive integer."
+[[ "$VIDEO_ENCODING_WORKERS" =~ ^[1-9][0-9]*$ ]] || \
+    die "VIDEO_ENCODING_WORKERS must be a positive integer."
 
 [[ -n "$CAMERA_CALIBRATION_PROFILE" ]] || \
     die "CAMERA_CALIBRATION_PROFILE must not be empty."
@@ -182,7 +211,9 @@ esac
 
 [[ "$INCLUDE_SURFACE_NORMALS" == 0 || "$INCLUDE_SURFACE_NORMALS" == 1 ]] || \
     die "INCLUDE_SURFACE_NORMALS must be 0 or 1."
-export INCLUDE_SURFACE_NORMALS
+[[ "$SURFACE_NORMALS_ENCODING_VERSION" == 1 || "$SURFACE_NORMALS_ENCODING_VERSION" == 2 ]] || \
+    die "SURFACE_NORMALS_ENCODING_VERSION must be 1 or 2."
+export INCLUDE_SURFACE_NORMALS SURFACE_NORMALS_ENCODING_VERSION
 
 if [[ "$COLOR_ONLY" == 1 && "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     die "--color-only cannot be combined with --include-surface-normals because normals require depth."
@@ -509,19 +540,32 @@ if include_depth:
         validate_realsense_rgbd_calibration,
     )
 
+    selected_calibration = NAMED_CAMERA_CALIBRATIONS.get(camera_calibration_profile)
     calibration_present = [value is not None for value in episode_calibrations]
-    if any(calibration_present) and not all(calibration_present):
-        missing = [
-            str(path)
-            for path, present in zip(episode_paths, calibration_present, strict=True)
-            if not present
-        ]
-        raise ValueError(
-            "Raw dataset mixes calibration-tagged and legacy episodes; "
-            f"missing info.depth.calibration in {missing!r}"
-        )
     recorded_calibration = None
-    if calibration_present and all(calibration_present):
+    if any(calibration_present) and not all(calibration_present):
+        if selected_calibration is None:
+            missing = [
+                str(path)
+                for path, present in zip(episode_paths, calibration_present, strict=True)
+                if not present
+            ]
+            raise ValueError(
+                "Raw dataset mixes calibration-tagged and legacy episodes; "
+                "an explicit matching camera calibration profile is required; "
+                f"missing info.depth.calibration in {missing!r}"
+            )
+        for path, value in zip(episode_paths, episode_calibrations, strict=True):
+            if value is None:
+                continue
+            recorded = validate_realsense_rgbd_calibration(value)
+            if recorded != selected_calibration:
+                raise ValueError(
+                    f"Recorded camera calibration {recorded['fingerprint']} in {path} "
+                    f"conflicts with profile {camera_calibration_profile!r} "
+                    f"({selected_calibration['fingerprint']})"
+                )
+    elif calibration_present and all(calibration_present):
         recorded = [
             validate_realsense_rgbd_calibration(value)
             for value in episode_calibrations
@@ -530,7 +574,6 @@ if include_depth:
         if any(value != recorded_calibration for value in recorded[1:]):
             raise ValueError("Raw dataset contains heterogeneous camera calibrations")
 
-    selected_calibration = NAMED_CAMERA_CALIBRATIONS.get(camera_calibration_profile)
     if (
         recorded_calibration is not None
         and selected_calibration is not None
@@ -620,7 +663,10 @@ printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
         )
     fi
     if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
-        MEDIA_ARGS+=(--include-surface-normals)
+        MEDIA_ARGS+=(
+            --include-surface-normals
+            --surface-normals-encoding-version "$SURFACE_NORMALS_ENCODING_VERSION"
+        )
     fi
 
     HF_HOME="$HF_HOME_TEMP" \
@@ -630,6 +676,8 @@ printf '[1/6] Converting processed Unitree episodes to LeRobot v3.0...\n'
         --repo-id "$REPO_ID" \
         --robot-type "$ROBOT_TYPE" \
         --mode video \
+        --dataset-config.depth-processing-workers "$DEPTH_PROCESSING_WORKERS" \
+        --dataset-config.video-encoding-workers "$VIDEO_ENCODING_WORKERS" \
         "${MEDIA_ARGS[@]}"
 )
 
@@ -694,7 +742,8 @@ if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf '[3b/6] Converting surface normals to verified 32-frame LZ4 chunks...\n'
     "$UNITREE_PYTHON" -u "$LZ4_SCRIPT" \
         --split-root "$V2_DATASET" \
-        --chunk-frames 32
+        --chunk-frames 32 \
+        --jobs "$JOBS"
 fi
 
 if [[ "$COLOR_ONLY" == 1 ]]; then
@@ -950,12 +999,14 @@ printf '[6/6] Validating metadata, episode count, selected media and video codec
     "$EXPECTED_HAND_DOF" \
     "$EXPECTED_RAW_TYPE" \
     "$EXPECTED_RAW_PROTOCOL" \
-    "$CAMERA_CALIBRATION_PROFILE" <<'PY'
+    "$CAMERA_CALIBRATION_PROFILE" \
+    "$SURFACE_NORMALS_ENCODING_VERSION" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 from unitree_lerobot.utils.camera_calibration import (
+    NAMED_CAMERA_CALIBRATIONS,
     validate_calibration_identity,
     validate_realsense_rgbd_calibration,
 )
@@ -973,6 +1024,7 @@ expected_hand_dof = int(sys.argv[9])
 expected_raw_type = sys.argv[10]
 expected_raw_protocol = sys.argv[11] or None
 camera_calibration_profile = sys.argv[12]
+expected_surface_normals_encoding_version = int(sys.argv[13])
 
 with (dataset / "meta" / "info.json").open(encoding="utf-8") as file:
     info = json.load(file)
@@ -989,9 +1041,14 @@ features = info["features"]
 camera_calibration = info.get("camera_calibration")
 if camera_calibration is not None:
     camera_calibration = validate_realsense_rgbd_calibration(camera_calibration)
-if include_depth and camera_calibration_profile == "d435i-254322071415":
-    assert camera_calibration is not None
-    assert camera_calibration["camera"]["serial"] == "254322071415"
+expected_profile_calibration = NAMED_CAMERA_CALIBRATIONS.get(
+    camera_calibration_profile
+)
+if include_depth and expected_profile_calibration is not None:
+    assert camera_calibration == expected_profile_calibration, (
+        "output camera calibration does not exactly match named profile "
+        f"{camera_calibration_profile!r}"
+    )
 
 assert features["observation.state"]["shape"] == [expected_vector_dim]
 assert features["action"]["shape"] == [expected_vector_dim]
@@ -1036,7 +1093,16 @@ if include_surface_normals:
     )
     assert surface_encoding["aligned_to"] == "color_0"
     assert surface_encoding["encoding"] == "camera_xyz_uint8"
-    assert surface_encoding["encoding_version"] == 1
+    assert surface_encoding["encoding_version"] == expected_surface_normals_encoding_version
+    if expected_surface_normals_encoding_version == 1:
+        assert "depth_valid_range_m" not in surface_encoding
+    else:
+        assert surface_encoding["depth_valid_range_m"] == {
+            "near_m": expected_depth_near_m,
+            "far_m": expected_depth_far_m,
+            "inclusive": True,
+            "required_samples": ["center", "left", "right", "up", "down"],
+        }
     compact_calibration = surface_encoding.get("camera_calibration")
     if camera_calibration is None:
         assert compact_calibration is None

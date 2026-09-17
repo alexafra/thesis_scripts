@@ -9,14 +9,16 @@ until every requested split has been converted and verified.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 import av
@@ -48,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         choices=("train", "validation", "test"),
     )
     parser.add_argument("--chunk-frames", type=int, default=32)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=6,
+        help="Maximum episodes decoded/compressed concurrently (default: 6).",
+    )
     return parser.parse_args()
 
 
@@ -254,7 +262,10 @@ def prepare_split(
     split: str,
     chunk_frames: int,
     split_root: Path | None = None,
+    jobs: int = 1,
 ) -> dict[str, Any]:
+    if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs <= 0:
+        raise ValueError(f"jobs must be a positive integer, got {jobs!r}")
     split_root = split_root if split_root is not None else dataset / split
     info_path = split_root / "meta" / "info.json"
     info = json.loads(info_path.read_text(encoding="utf-8"))
@@ -314,31 +325,67 @@ def prepare_split(
     total_frames = 0
     total_bytes = 0
     print(
-        f"[{split}] converting {len(episodes)} episodes into {building}",
+        f"[{split}] converting {len(episodes)} episodes into {building} "
+        f"with {min(jobs, len(episodes))} workers",
         flush=True,
     )
-    for ordinal, episode in enumerate(episodes, start=1):
+
+    def submit_episode(
+        executor: ThreadPoolExecutor,
+        ordinal: int,
+    ) -> tuple[int, dict[str, Any], Future]:
+        episode = episodes[ordinal - 1]
         episode_index = int(episode["episode_index"])
         expected_frames = int(episode["length"])
         source_video = canonical / f"episode_{episode_index:06d}.mp4"
-        frames, compressed_bytes, status = convert_episode(
-            source_video,
-            building,
-            episode_index,
-            expected_frames,
-            shape,
-            chunk_frames,
+        return (
+            ordinal,
+            episode,
+            executor.submit(
+                convert_episode,
+                source_video,
+                building,
+                episode_index,
+                expected_frames,
+                shape,
+                chunk_frames,
+            ),
         )
-        total_frames += frames
-        total_bytes += compressed_bytes
-        elapsed = time.monotonic() - split_started
-        print(
-            f"[{split} {ordinal:03d}/{len(episodes):03d}] "
-            f"episode_{episode_index:06d} {status}: {frames} frames, "
-            f"{compressed_bytes / (1024 ** 2):.1f} MiB; "
-            f"total {total_bytes / (1024 ** 3):.2f} GiB, {elapsed:.1f}s",
-            flush=True,
-        )
+
+    worker_count = min(jobs, len(episodes))
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="normals-lz4",
+    )
+    pending: deque[tuple[int, dict[str, Any], Future]] = deque()
+    next_ordinal = 1
+    try:
+        while next_ordinal <= len(episodes) and len(pending) < worker_count:
+            pending.append(submit_episode(executor, next_ordinal))
+            next_ordinal += 1
+
+        while pending:
+            ordinal, episode, future = pending.popleft()
+            # Preserve serial episode/error order even when later work finishes first.
+            frames, compressed_bytes, status = future.result()
+            episode_index = int(episode["episode_index"])
+            total_frames += frames
+            total_bytes += compressed_bytes
+            elapsed = time.monotonic() - split_started
+            print(
+                f"[{split} {ordinal:03d}/{len(episodes):03d}] "
+                f"episode_{episode_index:06d} {status}: {frames} frames, "
+                f"{compressed_bytes / (1024 ** 2):.1f} MiB; "
+                f"total {total_bytes / (1024 ** 3):.2f} GiB, {elapsed:.1f}s",
+                flush=True,
+            )
+            if next_ordinal <= len(episodes):
+                pending.append(submit_episode(executor, next_ordinal))
+                next_ordinal += 1
+    finally:
+        for _, _, future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
     expected_total = sum(int(item["length"]) for item in episodes)
     if total_frames != expected_total or total_frames != int(info["total_frames"]):
@@ -435,6 +482,8 @@ def main() -> int:
     args = parse_args()
     if args.chunk_frames <= 0:
         raise ValueError("--chunk-frames must be positive")
+    if args.jobs <= 0:
+        raise ValueError("--jobs must be positive")
     if not LZ4_BIN.is_file():
         raise RuntimeError(f"The lz4 CLI is required at {LZ4_BIN}")
 
@@ -450,6 +499,7 @@ def main() -> int:
                 split,
                 args.chunk_frames,
                 split_root=split_root,
+                jobs=args.jobs,
             )
         ]
     else:
@@ -459,9 +509,11 @@ def main() -> int:
         print(f"Dataset: {dataset}", flush=True)
         print(f"Splits: {', '.join(args.splits)}", flush=True)
         prepared = [
-            prepare_split(dataset, split, args.chunk_frames) for split in args.splits
+            prepare_split(dataset, split, args.chunk_frames, jobs=args.jobs)
+            for split in args.splits
         ]
     print(f"Chunk frames: {args.chunk_frames}", flush=True)
+    print(f"Episode jobs: {args.jobs}", flush=True)
     print("All requested splits verified; beginning canonical commit", flush=True)
     for item in prepared:
         commit_split(item, args.chunk_frames)

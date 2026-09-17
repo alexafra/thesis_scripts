@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,40 @@ WRAPPER = SCRIPT_ROOT / "convert_to_lerobot2.sh"
 UNITREE_REPO = Path("/home/alex/Development/unitree_lerobot")
 ISAAC_REPO = Path("/home/alex/Development/Isaac-GR00T")
 UNITREE_PYTHON = Path("/home/alex/miniconda3/envs/unitree_lerobot/bin/python")
+
+
+def _d435i_calibration() -> dict:
+    result = subprocess.run(
+        [
+            str(UNITREE_PYTHON),
+            "-c",
+            (
+                "import json; "
+                "from unitree_lerobot.utils.camera_calibration import "
+                "NAMED_CAMERA_CALIBRATIONS; "
+                "print(json.dumps(NAMED_CAMERA_CALIBRATIONS['d435i-254322071415']))"
+            ),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        cwd=UNITREE_REPO,
+    )
+    return json.loads(result.stdout)
+
+
+def _with_updated_fingerprint(calibration: dict) -> dict:
+    payload = {key: value for key, value in calibration.items() if key != "fingerprint"}
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    calibration["fingerprint"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    return calibration
 
 
 def _provenance(protocol: str = "dfx") -> dict:
@@ -217,6 +253,73 @@ def test_rgbd_preflight_rejects_mixed_calibration_tagging(tmp_path: Path):
 
     assert result.returncode != 0
     assert "mixes calibration-tagged and legacy episodes" in result.stdout
+
+
+def test_rgbd_preflight_accepts_profile_backed_mixed_calibration_tagging(
+    tmp_path: Path,
+):
+    _write_episode(
+        tmp_path,
+        depth=True,
+        name="episode_000001",
+        calibration=_d435i_calibration(),
+    )
+    _write_episode(tmp_path, depth=True, name="episode_000002")
+
+    result = _run(
+        tmp_path,
+        "--preflight-only",
+        "--camera-calibration-profile",
+        "d435i-254322071415",
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "Validated 2 RGB-D frames" in result.stdout
+
+
+def test_rgbd_preflight_rejects_conflicting_profile_backed_mixed_calibration(
+    tmp_path: Path,
+):
+    different = copy.deepcopy(_d435i_calibration())
+    different["camera"]["serial"] = "different-camera"
+    _with_updated_fingerprint(different)
+    _write_episode(
+        tmp_path,
+        depth=True,
+        name="episode_000001",
+        calibration=different,
+    )
+    _write_episode(tmp_path, depth=True, name="episode_000002")
+
+    result = _run(
+        tmp_path,
+        "--preflight-only",
+        "--camera-calibration-profile",
+        "d435i-254322071415",
+    )
+
+    assert result.returncode != 0
+    assert "conflicts with profile 'd435i-254322071415'" in result.stdout
+
+
+def test_final_metadata_validation_requires_complete_named_calibration():
+    wrapper = WRAPPER.read_text(encoding="utf-8")
+
+    assert "expected_profile_calibration = NAMED_CAMERA_CALIBRATIONS.get(" in wrapper
+    assert "camera_calibration == expected_profile_calibration" in wrapper
+    assert 'camera_calibration["camera"]["serial"] == "254322071415"' not in wrapper
+
+
+def test_surface_normal_wrapper_exposes_and_verifies_versioned_contract():
+    wrapper = WRAPPER.read_text(encoding="utf-8")
+
+    assert "--surface-normals-encoding-version" in wrapper
+    assert 'SURFACE_NORMALS_ENCODING_VERSION="${SURFACE_NORMALS_ENCODING_VERSION:-2}"' in wrapper
+    assert '--surface-normals-encoding-version "$SURFACE_NORMALS_ENCODING_VERSION"' in wrapper
+    assert 'surface_encoding["encoding_version"] == expected_surface_normals_encoding_version' in wrapper
+    assert '"depth_valid_range_m" not in surface_encoding' in wrapper
+    assert 'surface_encoding["depth_valid_range_m"] == {' in wrapper
+    assert '"required_samples": ["center", "left", "right", "up", "down"]' in wrapper
 
 
 def test_color_only_rejects_surface_normals(tmp_path: Path):
