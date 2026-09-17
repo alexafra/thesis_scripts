@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+from gr00t.data.types import VideoChannelSource
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "geometry_correspondence_evaluation.py"
@@ -119,6 +120,41 @@ def test_training_split_cannot_be_mislabeled_as_evaluation():
         raise AssertionError("training path must never be accepted as validation")
 
 
+def test_zero_image_is_rgb_only_and_zero_geometry_remains_geometry_only(tmp_path):
+    common = [
+        "--run-dir",
+        "/model",
+        "--dataset-path",
+        "/dataset/validation",
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+    args = geometry.parse_args(
+        [*common, "--view-key", "ego_view", "--intervention", "zero_image"]
+    )
+    assert args.geometry_key == "ego_view"
+    assert args.intervention == "zero_image"
+
+    for view_key, intervention in (
+        ("ego_view", "zero_geometry"),
+        ("surface_normals_view", "zero_image"),
+    ):
+        try:
+            geometry.parse_args(
+                [
+                    *common,
+                    "--view-key",
+                    view_key,
+                    "--intervention",
+                    intervention,
+                ]
+            )
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"{intervention} should be rejected for {view_key}")
+
+
 def test_numpy_label_encoding_does_not_truncate_task_or_cohort():
     task = "stack the three red cups."
     cohort = "right_only_1408"
@@ -152,6 +188,109 @@ def test_geometry_replacement_changes_only_requested_evaluation_view():
     )
     np.testing.assert_array_equal(shuffled["video.depth_gray_view"], donor[None])
     np.testing.assert_array_equal(flat["video.depth_gray_view"], depth)
+
+
+def test_rgb_replacement_changes_only_ego_view_and_zero_image_is_black():
+    rgb = np.arange(12, dtype=np.uint8).reshape(1, 2, 2, 3)
+    normals = np.full((1, 2, 2, 3), 127, dtype=np.uint8)
+    state = np.arange(4, dtype=np.float32).reshape(1, 4)
+    flat = {
+        "video.ego_view": rgb,
+        "video.surface_normals_view": normals,
+        "state.left_arm": state,
+        "annotation.human.task_description": "stack the three red cups.",
+    }
+    black = geometry.zero_geometry_frame(rgb[0])
+    replaced = geometry.replace_geometry(flat, "ego_view", black)
+
+    assert black.shape == rgb[0].shape
+    assert black.dtype == rgb.dtype
+    assert not np.any(black)
+    assert replaced["video.surface_normals_view"] is normals
+    assert replaced["state.left_arm"] is state
+    assert (
+        replaced["annotation.human.task_description"]
+        == flat["annotation.human.task_description"]
+    )
+    assert not np.any(replaced["video.ego_view"])
+    np.testing.assert_array_equal(flat["video.ego_view"], rgb)
+    assert "zero_image" in geometry.INTERVENTIONS
+
+
+def test_rgb_and_early_fusion_visual_contracts_remain_distinct():
+    shared = {
+        "state": geometry.ModalityConfig(delta_indices=[0], modality_keys=["state"]),
+        "action": geometry.ModalityConfig(
+            delta_indices=list(range(8)), modality_keys=["action"]
+        ),
+        "language": geometry.ModalityConfig(
+            delta_indices=[0], modality_keys=["annotation.human.task_description"]
+        ),
+    }
+    for companion_key, channels, intervention_keys in (
+        ("depth_gray_view", (0,), ("depth_gray_view",)),
+        (
+            "surface_normals_view",
+            (0, 1, 2),
+            ("ego_view", "surface_normals_view"),
+        ),
+    ):
+        fused = {
+            **shared,
+            "video": geometry.ModalityConfig(
+                delta_indices=[0],
+                modality_keys=["ego_view", companion_key],
+                channel_fusion=[
+                    VideoChannelSource("ego_view", (0, 1, 2)),
+                    VideoChannelSource(companion_key, channels),
+                ],
+            ),
+        }
+        for intervention_key in intervention_keys:
+            assert (
+                geometry._validate_contract(
+                    fused,
+                    geometry_key=intervention_key,
+                    execution_horizon=8,
+                )
+                == 8
+            )
+
+    rgb_only = {
+        **shared,
+        "video": geometry.ModalityConfig(delta_indices=[0], modality_keys=["ego_view"]),
+    }
+    try:
+        geometry._validate_contract(
+            rgb_only,
+            geometry_key="ego_view",
+            execution_horizon=8,
+        )
+    except ValueError as exc:
+        assert "surface_normals_view" in str(exc)
+    else:
+        raise AssertionError(
+            "RGB-only model must not satisfy the rgb_in_normals contract"
+        )
+
+
+def test_rgb_metadata_declares_only_rgb_changed():
+    assert geometry.unchanged_inputs_for_visual_intervention(
+        "ego_view", ["ego_view", "surface_normals_view"]
+    ) == [
+        "surface_normals_view",
+        "state",
+        "language",
+        "expert_action",
+    ]
+    assert geometry.unchanged_inputs_for_visual_intervention(
+        "surface_normals_view", ["ego_view", "surface_normals_view"]
+    ) == [
+        "ego_view",
+        "state",
+        "language",
+        "expert_action",
+    ]
 
 
 def test_zero_geometry_preserves_shape_dtype_and_supports_depth_and_normals():
@@ -225,19 +364,22 @@ def test_paired_summary_reports_sensitivity_and_positive_counterfactual_error_de
     assert primary["episode_macro_prediction_change_mae"] == 0.5
 
 
-def test_runner_is_evaluation_only_and_supports_selected_interventions_for_both_models():
+def test_runner_is_evaluation_only_and_supports_selected_interventions_for_all_models():
     runner = SCRIPT_PATH.with_name("multi_geometry_correspondence_evaluation.sh")
     text = runner.read_text(encoding="utf-8")
 
     for required in (
         'MODE="${MODE:-both}"',
         'GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")',
+        'GEOMETRY_KEYS=("ego_view")',
+        'REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")',
         'INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"',
-        "offset_10pct | offset_50pct | zero_geometry",
+        "offset_10pct | offset_50pct | zero_geometry | zero_image",
         'NORMALS_MODEL="${NORMALS_MODEL:-',
+        "rgb_in_normals)",
         'DATASET_SCOPE="validation"',
         'DATASET_PATH="$DATASET_ROOT/validation"',
-        "--geometry-key",
+        "--view-key",
         "--intervention",
         "--shuffle-seed 42",
         "HF_HUB_OFFLINE=1",
@@ -272,6 +414,14 @@ def test_zero_geometry_frame_mapping_has_no_donor():
     assert all(row["donor_episode_index"] is None for row in rows)
     assert all(row["donor_frame"] is None for row in rows)
 
+    rgb_rows = geometry._frame_mapping(
+        [record],
+        {0: {}},
+        execution_horizon=8,
+        intervention="zero_image",
+    )
+    assert rgb_rows == [{**row, "intervention": "zero_image"} for row in rows]
+
 
 def test_same_episode_offset_mapping_uses_recipient_episode_without_donor_assignment():
     record = _record(0, "task a", length=101)
@@ -291,7 +441,7 @@ def test_same_episode_offset_mapping_uses_recipient_episode_without_donor_assign
         {
             "intervention": "offset_10pct",
             "donor_required": False,
-            "replacement": "same-episode geometry with a circular integer-frame shift",
+            "replacement": "same-episode visual input with a circular integer-frame shift",
             "phase_offset_fraction": 0.1,
         }
     ]

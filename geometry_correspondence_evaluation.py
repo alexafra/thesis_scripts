@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Measure whether a GR00T policy uses correctly aligned geometry.
+"""Measure whether a GR00T policy uses correctly aligned visual input.
 
-It evaluates paired observations whose RGB, robot state, language, target
-actions, diffusion noise, and inference frame are identical.  The intervention
-changes only ``depth_gray_view`` or ``surface_normals_view`` using a same-task
-cross-episode donor, a same-episode temporal offset, or an all-zero geometry
-frame.
+It evaluates paired observations whose non-intervened inputs, robot state,
+language, target actions, diffusion noise, and inference frame are identical.
+The intervention changes only ``ego_view``, ``depth_gray_view``, or
+``surface_normals_view`` using a same-task cross-episode donor, a same-episode
+temporal offset, or an all-zero visual frame.
 
-Dataset files are read-only.  Geometry replacement happens only in memory.
-Positive counterfactual-minus-intact error means the intact geometry helped
+Dataset files are read-only.  Visual replacement happens only in memory.
+Positive counterfactual-minus-intact error means the intact visual input helped
 open-loop action prediction.  Prediction change measures sensitivity, which is
 not by itself evidence of benefit or closed-loop task success.
 """
@@ -47,12 +47,14 @@ import torch
 
 LOGGER = logging.getLogger("geometry_correspondence_evaluation")
 GEOMETRY_KEYS = ("depth_gray_view", "surface_normals_view")
+VISUAL_KEYS = ("ego_view", *GEOMETRY_KEYS)
 CROSS_EPISODE_INTERVENTIONS = ("phase_matched", "out_of_phase")
 SAME_EPISODE_OFFSETS = {"offset_10pct": 0.10, "offset_50pct": 0.50}
+ZERO_INTERVENTIONS = ("zero_geometry", "zero_image")
 INTERVENTIONS = (
     *CROSS_EPISODE_INTERVENTIONS,
     *SAME_EPISODE_OFFSETS,
-    "zero_geometry",
+    *ZERO_INTERVENTIONS,
 )
 CONDITIONS = ("intact", "counterfactual")
 
@@ -91,14 +93,23 @@ class DonorAssignment:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare paired intact and counterfactual geometry on a held-out "
+            "Compare paired intact and counterfactual visual inputs on a held-out "
             "LeRobot evaluation split."
         )
     )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--geometry-key", choices=GEOMETRY_KEYS, required=True)
+    parser.add_argument(
+        "--view-key",
+        "--geometry-key",
+        dest="geometry_key",
+        choices=VISUAL_KEYS,
+        required=True,
+        help=(
+            "Visual input to replace. --geometry-key remains as a compatibility alias."
+        ),
+    )
     parser.add_argument(
         "--intervention", choices=INTERVENTIONS, default="phase_matched"
     )
@@ -145,6 +156,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--bootstrap-replicates must be non-negative")
     if args.max_episodes < 0:
         parser.error("--max-episodes must be non-negative")
+    if args.geometry_key == "ego_view" and args.intervention == "zero_geometry":
+        parser.error("ego_view uses --intervention zero_image, not zero_geometry")
+    if args.geometry_key != "ego_view" and args.intervention == "zero_image":
+        parser.error("zero_image is only valid for ego_view")
     if args.task:
         args.task = list(dict.fromkeys(value.strip() for value in args.task))
         if any(not value for value in args.task):
@@ -437,24 +452,28 @@ def _validate_contract(
     video = modality.get("video")
     if video is None:
         raise ValueError("Policy has no video modality")
-    expected_keys = ["ego_view", geometry_key]
+    expected_keys = (
+        ["ego_view", "surface_normals_view"]
+        if geometry_key == "ego_view"
+        else ["ego_view", geometry_key]
+    )
     if list(video.modality_keys) != expected_keys:
         raise ValueError(
-            f"Expected early-fusion video keys {expected_keys}, got {video.modality_keys}"
+            f"Expected video keys {expected_keys}, got {video.modality_keys}"
         )
     if [int(value) for value in video.delta_indices] != [0]:
         raise ValueError(
-            f"Geometry shuffle requires video delta_indices=[0], got {video.delta_indices}"
+            f"Visual shuffle requires video delta_indices=[0], got {video.delta_indices}"
         )
     if video.channel_fusion is None:
         raise ValueError("Expected an early-fusion channel contract")
     source_keys = [source.key for source in video.channel_fusion]
     if source_keys != expected_keys:
         raise ValueError(f"Unexpected channel-fusion sources: {source_keys}")
-    expected_channels = 4 if geometry_key == "depth_gray_view" else 6
+    expected_channels = 4 if "depth_gray_view" in expected_keys else 6
     if video.vision_input_channels != expected_channels:
         raise ValueError(
-            f"Expected {expected_channels} fused channels for {geometry_key}, "
+            f"Expected {expected_channels} fused channels for {expected_keys}, "
             f"got {video.vision_input_channels}"
         )
     for name, config in modality.items():
@@ -497,7 +516,7 @@ def _flat_observation(
 def replace_geometry(
     flat: dict[str, Any], geometry_key: str, replacement_frame: Any
 ) -> dict[str, Any]:
-    """Return a shallow copy with exactly one batched video tensor replaced."""
+    """Return a shallow copy with exactly one batched visual tensor replaced."""
 
     column = f"video.{geometry_key}"
     if column not in flat:
@@ -514,9 +533,7 @@ def replace_geometry(
     replaced = dict(flat)
     replaced[column] = replacement
     if any(replaced[key] is not value for key, value in flat.items() if key != column):
-        raise RuntimeError(
-            "Geometry intervention copied or changed a non-geometry input"
-        )
+        raise RuntimeError("Visual intervention copied or changed another input")
     return replaced
 
 
@@ -537,7 +554,7 @@ def _paired_observations(
 
 
 def zero_geometry_frame(target_frame: Any) -> np.ndarray:
-    """Create an all-zero frame with the exact shape and dtype of a geometry frame."""
+    """Create an all-zero frame with the exact shape and dtype of a visual frame."""
 
     target = np.asarray(target_frame)
     return np.zeros_like(target)
@@ -700,15 +717,15 @@ def _evaluate_checkpoint(
             donor_trajectory = None
             donor_frames: dict[int, int] = {}
             replacement_episode_index = None
-            if intervention == "zero_geometry":
+            if intervention in ZERO_INTERVENTIONS:
                 if assignment is not None or donor_loader is not None:
                     raise RuntimeError(
-                        "zero_geometry must not construct or decode donors"
+                        f"{intervention} must not construct or decode donors"
                     )
             elif intervention in SAME_EPISODE_OFFSETS:
                 if assignment is not None or donor_loader is None:
                     raise RuntimeError(
-                        f"{intervention} requires no donor assignment and a geometry loader"
+                        f"{intervention} requires no donor assignment and a visual loader"
                     )
                 donor_frames = {
                     anchor: same_episode_frame_for_offset(
@@ -724,7 +741,7 @@ def _evaluate_checkpoint(
                 )
                 if len(donor_trajectory) != recipient.length:
                     raise ValueError(
-                        f"Same-episode geometry length for episode {recipient.episode_index} "
+                        f"Same-episode visual length for episode {recipient.episode_index} "
                         f"was {len(donor_trajectory)}, expected {recipient.length}"
                     )
                 replacement_episode_index = recipient.episode_index
@@ -764,13 +781,13 @@ def _evaluate_checkpoint(
                 observations = []
                 seeds = []
                 for anchor in batch_anchors:
-                    if intervention == "zero_geometry":
+                    if intervention in ZERO_INTERVENTIONS:
                         target_value = target_trajectory[f"video.{geometry_key}"].iloc[
                             anchor
                         ]
                         if target_value is None:
                             raise ValueError(
-                                f"Target geometry was not decoded for frame {anchor}"
+                                f"Target visual input was not decoded for frame {anchor}"
                             )
                         replacement_frame = zero_geometry_frame(target_value)
                     else:
@@ -780,7 +797,7 @@ def _evaluate_checkpoint(
                         ].iloc[donor_frames[anchor]]
                         if replacement_frame is None:
                             raise ValueError(
-                                "Replacement geometry was not decoded for frame "
+                                "Replacement visual input was not decoded for frame "
                                 f"{donor_frames[anchor]}"
                             )
                     intact_observation, counterfactual_observation = (
@@ -1186,7 +1203,7 @@ def summarize_paired_effects(
                         per_episode["prediction_change"].mean()
                     ),
                     "interpretation": (
-                        "positive error deltas mean correctly aligned geometry predicted "
+                        "positive error deltas mean correctly aligned visual input predicted "
                         "the recorded actions more accurately"
                     ),
                 }
@@ -1199,12 +1216,12 @@ def _donor_manifest(
     *,
     intervention: str,
 ) -> list[dict[str, Any]]:
-    if intervention == "zero_geometry":
+    if intervention in ZERO_INTERVENTIONS:
         return [
             {
                 "intervention": intervention,
                 "donor_required": False,
-                "replacement": "all-zero frame with target shape and dtype",
+                "replacement": "all-zero visual frame with target shape and dtype",
             }
         ]
     if intervention in SAME_EPISODE_OFFSETS:
@@ -1212,7 +1229,7 @@ def _donor_manifest(
             {
                 "intervention": intervention,
                 "donor_required": False,
-                "replacement": "same-episode geometry with a circular integer-frame shift",
+                "replacement": "same-episode visual input with a circular integer-frame shift",
                 "phase_offset_fraction": SAME_EPISODE_OFFSETS[intervention],
             }
         ]
@@ -1238,10 +1255,10 @@ def _frame_mapping(
                 recipient_progress = (
                     anchor / (recipient.length - 1) if recipient.length > 1 else 0.0
                 )
-                if intervention == "zero_geometry":
+                if intervention in ZERO_INTERVENTIONS:
                     if assignment is not None:
                         raise RuntimeError(
-                            "zero_geometry must not have donor assignments"
+                            f"{intervention} must not have donor assignments"
                         )
                     donor_progress = None
                     donor_frame = None
@@ -1391,6 +1408,26 @@ def validate_heldout_dataset_path(dataset_path: Path, split: str) -> Path:
     return resolved
 
 
+def unchanged_inputs_for_visual_intervention(
+    view_key: str, video_keys: Iterable[str]
+) -> list[str]:
+    """List the paired inputs held identical when one visual stream is replaced."""
+
+    if view_key not in VISUAL_KEYS:
+        raise ValueError(f"Unknown visual input: {view_key}")
+    video_keys = [str(key) for key in video_keys]
+    if view_key not in video_keys:
+        raise ValueError(
+            f"Changed input {view_key!r} is absent from video keys {video_keys}"
+        )
+    return [
+        *(key for key in video_keys if key != view_key),
+        "state",
+        "language",
+        "expert_action",
+    ]
+
+
 def _run_metadata(
     *,
     args: argparse.Namespace,
@@ -1409,7 +1446,7 @@ def _run_metadata(
     if args.intervention == "phase_matched":
         intervention_detail = {
             "name": args.intervention,
-            "replacement": "same-task cross-episode donor geometry",
+            "replacement": "same-task cross-episode donor visual input",
             "donor_rule": (
                 "different episode, exact same task, deterministic cyclic derangement"
             ),
@@ -1421,7 +1458,7 @@ def _run_metadata(
     elif args.intervention == "out_of_phase":
         intervention_detail = {
             "name": args.intervention,
-            "replacement": "same-task cross-episode donor geometry",
+            "replacement": "same-task cross-episode donor visual input",
             "donor_rule": (
                 "different episode, exact same task, deterministic cyclic derangement"
             ),
@@ -1434,7 +1471,7 @@ def _run_metadata(
         offset = SAME_EPISODE_OFFSETS[args.intervention]
         intervention_detail = {
             "name": args.intervention,
-            "replacement": "geometry from the same episode after a circular frame shift",
+            "replacement": "selected visual input from the same episode after a circular frame shift",
             "donor_rule": "same episode as the intact observation",
             "frame_rule": (
                 "replacement_frame = (recipient_frame + "
@@ -1443,36 +1480,48 @@ def _run_metadata(
             "phase_offset_fraction": offset,
             "caveat": (
                 "the integer circular shift wraps near the episode end and intentionally breaks "
-                "instantaneous RGB/geometry correspondence"
+                "instantaneous correspondence with the other observation inputs"
             ),
         }
-    elif args.intervention == "zero_geometry":
+    elif args.intervention in ZERO_INTERVENTIONS:
+        is_rgb = args.geometry_key == "ego_view"
         intervention_detail = {
             "name": args.intervention,
-            "replacement": "all-zero frame with the target geometry shape and dtype",
+            "replacement": "all-black RGB frame"
+            if is_rgb
+            else "all-zero geometry frame",
             "donor_rule": None,
             "frame_rule": None,
             "caveat": (
-                "all-zero geometry is a strong out-of-distribution ablation, not a "
+                "an all-black RGB image is a strong out-of-distribution ablation, not a "
+                "realistic camera sample"
+                if is_rgb
+                else "all-zero geometry is a strong out-of-distribution ablation, not a "
                 "realistic sensor sample"
             ),
         }
     else:
         raise ValueError(f"Unknown intervention: {args.intervention}")
     return {
-        "version": 3,
+        "version": 4,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_seconds,
         "offline_only": True,
         "dataset_mutated": False,
         "intervention": {
             "changed_input": args.geometry_key,
-            "unchanged_inputs": ["ego_view", "state", "language", "expert_action"],
+            "changed_input_type": (
+                "rgb_image" if args.geometry_key == "ego_view" else "geometry_image"
+            ),
+            "unchanged_inputs": unchanged_inputs_for_visual_intervention(
+                args.geometry_key,
+                modality_signature["video"]["keys"],
+            ),
             **intervention_detail,
         },
         "interpretation": (
-            "Prediction change measures geometry sensitivity. Positive "
-            "counterfactual-minus-intact error means intact geometry predicted the recorded "
+            "Prediction change measures visual-input sensitivity. Positive "
+            "counterfactual-minus-intact error means the intact input predicted the recorded "
             "actions more accurately; neither quantity proves closed-loop task success."
         ),
         "arguments": arguments,
@@ -1554,7 +1603,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             donor_loader = (
                 None
-                if args.intervention == "zero_geometry"
+                if args.intervention in ZERO_INTERVENTIONS
                 else LeRobotEpisodeLoader(
                     args.dataset_path,
                     modality_configs=_donor_modality(modality, args.geometry_key),

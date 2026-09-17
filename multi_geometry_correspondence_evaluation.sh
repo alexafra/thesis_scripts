@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Evaluation-only geometry correspondence ablation. This script never trains,
+# Evaluation-only visual correspondence ablation. This script never trains,
 # mutates a dataset, queues itself, or opens a robot/DDS connection.
 export PATH="/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
@@ -38,7 +38,7 @@ for intervention in "${INTERVENTIONS[@]}"; do
         phase_matched | out_of_phase)
             REQUIRES_CROSS_EPISODE_DONORS=1
             ;;
-        offset_10pct | offset_50pct | zero_geometry) ;;
+        offset_10pct | offset_50pct | zero_geometry | zero_image) ;;
         *)
             echo "ERROR: unsupported INTERVENTIONS_CSV entry: $intervention" >&2
             exit 1
@@ -54,27 +54,49 @@ done
 RGBD_MODEL="${RGBD_MODEL:-$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 NORMALS_MODEL="${NORMALS_MODEL:-$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 
+INTERVENES_ON_RGB=0
 case "$MODE" in
+    rgb_in_normals)
+        MODEL_DIRS=("$NORMALS_MODEL")
+        GEOMETRY_KEYS=("ego_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
+        LABELS=("rgb_in_rgb_normals")
+        INTERVENES_ON_RGB=1
+        ;;
     depth)
         MODEL_DIRS=("$RGBD_MODEL")
         GEOMETRY_KEYS=("depth_gray_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view")
         LABELS=("rgbd")
         ;;
     normals)
         MODEL_DIRS=("$NORMALS_MODEL")
         GEOMETRY_KEYS=("surface_normals_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
         LABELS=("rgb_normals")
         ;;
     both)
         MODEL_DIRS=("$RGBD_MODEL" "$NORMALS_MODEL")
         GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view" "surface_normals_view")
         LABELS=("rgbd" "rgb_normals")
         ;;
     *)
-        echo "ERROR: MODE must be depth, normals, or both; got $MODE" >&2
+        echo "ERROR: MODE must be rgb_in_normals, depth, normals, or both; got $MODE" >&2
         exit 1
         ;;
 esac
+
+for intervention in "${INTERVENTIONS[@]}"; do
+    if [[ "$INTERVENES_ON_RGB" == "1" && "$intervention" == "zero_geometry" ]]; then
+        echo "ERROR: MODE=rgb_in_normals uses zero_image, not zero_geometry" >&2
+        exit 1
+    fi
+    if [[ "$INTERVENES_ON_RGB" != "1" && "$intervention" == "zero_image" ]]; then
+        echo "ERROR: zero_image is only valid with MODE=rgb_in_normals" >&2
+        exit 1
+    fi
+done
 
 case "$PRECHECK_ONLY" in
     0 | 1) ;;
@@ -222,10 +244,10 @@ for i in "${!MODEL_DIRS[@]}"; do
         validate_checkpoint_artifacts "$model_dir/checkpoint-$selected"
     done
     SELECTED_STEPS+=("$step")
-    echo "READY: ${LABELS[$i]} geometry=$geometry_key checkpoint(s)=$step"
+    echo "READY: ${LABELS[$i]} view=$geometry_key checkpoint(s)=$step"
 done
 
-"$GROOT_PYTHON" - "$DATASET_PATH" "$REQUIRES_CROSS_EPISODE_DONORS" "${GEOMETRY_KEYS[@]}" <<'PY'
+"$GROOT_PYTHON" - "$DATASET_PATH" "$REQUIRES_CROSS_EPISODE_DONORS" "${REQUIRED_VIDEO_KEYS[@]}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -298,7 +320,7 @@ for i in "${!MODEL_DIRS[@]}"; do
     done
 done
 
-printf 'model\tgeometry_key\tintervention\tcheckpoint_steps\tstatus\texit_code\toutput_dir\n' > "$STATUS_FILE"
+printf 'model\tview_key\tintervention\tcheckpoint_steps\tstatus\texit_code\toutput_dir\n' > "$STATUS_FILE"
 FAILURES=()
 exec > >(tee -a "$LOG_FILE") 2>&1
 cd "$GROOT_DIR"
@@ -316,7 +338,7 @@ for i in "${!MODEL_DIRS[@]}"; do
         echo "============================================================"
         echo "Analysis ${analysis_number}/${TOTAL_ANALYSES}: ${LABELS[$i]} / $intervention"
         echo "Model: $model_dir"
-        echo "Geometry key: $geometry_key only"
+        echo "View key: $geometry_key only"
         echo "Intervention: $intervention"
         echo "Held-out split: $DATASET_PATH"
         echo "Checkpoint(s): $step"
@@ -327,7 +349,7 @@ for i in "${!MODEL_DIRS[@]}"; do
             --run-dir "$model_dir" \
             --dataset-path "$DATASET_PATH" \
             --output-dir "$output_dir" \
-            --geometry-key "$geometry_key" \
+            --view-key "$geometry_key" \
             --intervention "$intervention" \
             --split "$DATASET_SCOPE" \
             --checkpoint-steps "${checkpoint_args[@]}" \
