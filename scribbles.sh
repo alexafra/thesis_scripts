@@ -13,8 +13,8 @@ MODALITY_CONFIGS=(
 )
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_d1_batch_32_acc_1_1008_1_test"
-    "$HOME/Development/Models/c_only_batch_32_acc_1_1008_1_test"
+    "$HOME/Development/Models/dex3/c_d1_batch_32_acc_1_1008_1_test"
+    "$HOME/Development/Models/dex3/c_only_batch_32_acc_1_1008_1_test"
 )
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ]]; then
@@ -59,6 +59,7 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
         --max-steps 50 \
         --save-steps 25 \
         --save-total-limit 2 \
+        --skip-final-model-save \
         --color-jitter-params \
             brightness 0.20 \
             contrast 0.15 \

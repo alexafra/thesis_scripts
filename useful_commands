@@ -13,7 +13,7 @@ done
 
 cd "$HOME/Development/Isaac-GR00T"
 
-RUN_DIR="$HOME/Development/Models/gr00t_batch_2_acc_8_0803_0217"
+RUN_DIR="$HOME/Development/Models/dex3/gr00t_batch_2_acc_8_0803_0217"
 
 uv run --no-sync python scripts/analysis_tools/plot_training_history.py \
     --run-dir "$RUN_DIR" \
@@ -53,13 +53,13 @@ python examples/SimplerEnv/convert_av1_to_h264.py \
 cd "$HOME/Development/Isaac-GR00T"
 
 TRAIN_DATASET="$HOME/Development/Datasets/lerobot2/pick_toothepaste_3107_train_lerobot"
-TRAIN_DIR="$HOME/Development/Models/groot_g1_toothpaste_40ep_$(date +%Y%m%d_%H%M%S)"
+TRAIN_DIR="$HOME/Development/Models/dex3/groot_g1_toothpaste_40ep_$(date +%Y%m%d_%H%M%S)"
 
 echo "$TRAIN_DATASET"
 echo "$TRAIN_DIR"
 
 /home/alex/Development/Datasets/lerobot2/Toothpaste_green_plate_2807_hand_close
-DRYRUN_DIR="$HOME/Development/Models/groot_g1_dryrun_$(date +%Y%m%d_%H%M%S)"
+DRYRUN_DIR="$HOME/Development/Models/dex3/groot_g1_dryrun_$(date +%Y%m%d_%H%M%S)"
 
 
 uv run --no-sync python gr00t/data/stats.py \
@@ -85,7 +85,8 @@ uv run --no-sync python gr00t/experiment/launch_finetune.py \
     --learning-rate 1e-4 \
     --max-steps 5000 \
     --save-steps 1000 \
-    --save-total-limit 5
+    --save-total-limit 5 \
+    --skip-final-model-save
 
 
 
@@ -101,8 +102,9 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python gr00t/experiment/launch_finetune.
     --dataloader-num-workers 1 \
     --episode-sampling-rate 1.0 \
     --max-steps 2 \
-    --save-steps 1000 \
+    --save-steps 2 \
     --save-total-limit 1 \
+    --skip-final-model-save \
     --save-only-model
 
 

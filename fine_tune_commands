@@ -1,7 +1,7 @@
 cd "$HOME/Development/Isaac-GR00T"
 
 TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/Toothpaste_green_plate_2807_hand_close"
-TRAIN_DIR="$HOME/Development/Models/groot_g1_test"
+TRAIN_DIR="$HOME/Development/Models/dex3/groot_g1_test"
 
 echo "$TRAIN_DATASET"
 echo "$TRAIN_DIR"
@@ -28,8 +28,9 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --optim adafactor \
     --learning-rate 1e-4 \
     --max-steps 2 \
-    --save-steps 1000 \
-    --save-total-limit 5
+    --save-steps 2 \
+    --save-total-limit 5 \
+    --skip-final-model-save
 
 
 #OGGGG
@@ -51,4 +52,5 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --learning-rate 1e-4 \
     --max-steps 5000 \
     --save-steps 1000 \
-    --save-total-limit 5
+    --save-total-limit 5 \
+    --skip-final-model-save
