@@ -11,8 +11,8 @@ MODALITY_CONFIGS=(
 )
 
 TRAIN_DIRS=(
-    "$HOME/Development/Models/combined_gray_depth_batch_32_acc_1_0908_1_test"
-    "$HOME/Development/Models/combined_colour_only_batch_32_acc_1_0908_1_test"
+    "$HOME/Development/Models/dex3/combined_gray_depth_batch_32_acc_1_0908_1_test"
+    "$HOME/Development/Models/dex3/combined_colour_only_batch_32_acc_1_0908_1_test"
 )
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#TRAIN_DIRS[@]} ]]; then
@@ -53,8 +53,9 @@ for i in "${!MODALITY_CONFIGS[@]}"; do
         --optim adafactor \
         --learning-rate 1e-4 \
         --max-steps 5 \
-        --save-steps 1000 \
+        --save-steps 5 \
         --save-total-limit 5 \
+        --skip-final-model-save \
         --color-jitter-params \
             brightness 0.20 \
             contrast 0.15 \

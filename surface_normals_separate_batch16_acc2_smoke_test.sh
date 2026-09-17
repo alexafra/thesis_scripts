@@ -3,7 +3,7 @@ set -uo pipefail
 
 cd /home/alex/Development/Isaac-GR00T
 
-OUTPUT=/home/alex/Development/Models/c_normals_separate_patch_tuned_bf16_batch_16_acc_2_chunk_32_1608_1_test
+OUTPUT=/home/alex/Development/Models/dex3/c_normals_separate_patch_tuned_bf16_batch_16_acc_2_chunk_32_1608_1_test
 LOG_ROOT=/home/alex/Development/logs/groot/smoke
 mkdir -p "$LOG_ROOT"
 LOG=$LOG_ROOT/surface_normals_separate_batch16_acc2_smoke_1608_1.log
@@ -38,6 +38,7 @@ if CUDA_VISIBLE_DEVICES=0 \
        --max-steps 1 \
        --save-steps 1 \
        --save-total-limit 1 \
+       --skip-final-model-save \
        --color-jitter-params \
            brightness 0.20 \
            contrast 0.15 \

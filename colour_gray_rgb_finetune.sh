@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$HOME/Development/Isaac-GR00T"
 
 TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/combined_09_08_1/train"
-TRAIN_DIR="$HOME/Development/Models/combined_gray_scale_1_batch_32_acc_1_0908_1_test"
+TRAIN_DIR="$HOME/Development/Models/dex3/combined_gray_scale_1_batch_32_acc_1_0908_1_test"
 
 echo "$TRAIN_DATASET"
 echo "$TRAIN_DIR"
@@ -32,6 +32,7 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --max-steps 5000 \
     --save-steps 1000 \
     --save-total-limit 5 \
+    --skip-final-model-save \
     --color-jitter-params \
         brightness 0.20 \
         contrast 0.15 \
@@ -41,7 +42,7 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
 cd "$HOME/Development/Isaac-GR00T"
 
 TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/combined_09_08_1/train"
-TRAIN_DIR="$HOME/Development/Models/combined_colour_only_scale_1_batch_32_acc_1_0908_1"
+TRAIN_DIR="$HOME/Development/Models/dex3/combined_colour_only_scale_1_batch_32_acc_1_0908_1"
 
 echo "$TRAIN_DATASET"
 echo "$TRAIN_DIR"
@@ -70,6 +71,7 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --max-steps 5000 \
     --save-steps 1000 \
     --save-total-limit 5 \
+    --skip-final-model-save \
     --color-jitter-params \
         brightness 0.20 \
         contrast 0.15 \

@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="/home/alex/Development/Isaac-GR00T"
 DATASET_PATH="/home/alex/Development/Datasets/lerobot2/atomic_combined_09_08_And_10_08_testing_surface_normal_compression/train_plain_lz4"
 BASE_MODEL_PATH="/home/alex/Development/Models/GR00T-N1.7-3B"
-OUTPUT_DIR="/home/alex/Development/Models/c_normals_separate_batch_8_acc_4_chunk_32_400_surface_normal_compression_test"
+OUTPUT_DIR="/home/alex/Development/Models/dex3/c_normals_separate_batch_8_acc_4_chunk_32_400_surface_normal_compression_test"
 MODALITY_CONFIG="examples/UnitreeG1/g1_dex3_head_3_channel_surface_normals_config.py"
 
 if [[ ! -f "$DATASET_PATH/meta/info.json" ]]; then
@@ -50,6 +50,7 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --max-steps 400 \
     --save-steps 400 \
     --save-total-limit 8 \
+    --skip-final-model-save \
     --color-jitter-params \
         brightness 0.20 \
         contrast 0.15 \

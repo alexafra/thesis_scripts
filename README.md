@@ -63,6 +63,12 @@ per-leaf converted intermediates:
   --split-seed 42
 ```
 
+`check` remains read-only. A collection `convert` or `all` command must also
+carry `--allow-full-reconversion`. This is an intentional guard: once a
+converted corpus exists, adding another processed-raw leaf must use an append
+pipeline and must not reconvert the old episodes. The authorization flag is for
+an initial collection build or a deliberate from-scratch rebuild only.
+
 `--preserve-split` preserves that leaf's existing membership and within-split
 order while refreshing its current goal, frame-count, and `data.json` hash
 provenance. Every unpreserved leaf is split independently with the requested
@@ -138,6 +144,77 @@ validation run:
 ./prepare_inspire_lerobot2.sh train --dataset-name task
 ```
 
+## Incremental Inspire append (452 + both 2026-09-15 components)
+
+`append_inspire_stack_0915.sh` is the dedicated incremental path for
+adding 145 `stack_red_cups_09_15` episodes and 58 literal
+`woorden_block_09_15` episodes to the migrated 452-episode corpus. It
+goal-stratifies each source independently with seed 42, preserves stack-then-
+woorden ordering within every split, and targets the exact sibling
+`all_tasks_655eps_20260916_normals_range_mask_v2`.
+
+The dataset-only production command is explicit and cannot start training:
+
+```bash
+/home/alex/Development/scripts/append_inspire_stack_0915.sh build
+```
+
+For a detached user service, use this exact dataset-only launch:
+
+```bash
+systemd-run --user \
+  --unit=inspire-655-v2-append-20260916 \
+  --collect \
+  /usr/bin/bash \
+  /home/alex/Development/scripts/append_inspire_stack_0915.sh build
+```
+
+There is no implicit mode and the wrapper has no training mode. `check`
+performs read-only preflight; `build` stops after dataset publication. Training
+must be launched separately only after a later explicit authorization.
+
+The append is transactional and retains resumable hidden checkpoints. It makes
+a zero-block hard-link view of both raw sources, composes one disposable raw
+split, converts only the new 203-episode component, and uses the existing
+`append_lerobot2.py` compatibility checks for features, 26D modality layout,
+and exact camera-calibration equality. To bound peak disk use on ext4, the
+existing base and immutable incoming media are hard-linked only into a hidden
+build. After that build is sealed, the adopted component is retired to free
+space; every surviving base hard link is then detached, the unchanged input
+digests and zero-shared-base-inode condition are verified, and only then is the
+build atomically renamed without replacement. The original base and both
+processed-raw sources remain untouched.
+
+If interruption occurs after the validated build has moved into the checkpoint
+but before its phase record advances, the next `build` invocation revalidates
+the component, final population/provenance, statistics, and source snapshots,
+then rolls the checkpoint forward without deleting the build. An external
+unsealed `.build-*` scratch remains deliberately fail-closed for manual
+inspection because it can represent several earlier incomplete phases.
+
+Before detachment and publication, the wrapper deletes the merged train
+statistics cache and runs the same `python -m gr00t.data.stats` finalization
+used by the training launcher against the hidden final `train/` split only. It
+verifies fresh schema/config fingerprints, finite 26D state/action statistics,
+32x7 relative-arm statistics, q01/q99 bounds, frame/trajectory count sources,
+and byte-identical validation/test statistics. This is dataset finalization;
+it does not load a model or start training.
+
+Expected final populations are 525/65/65 episodes and
+196,453/22,719/24,566 frames for train/validation/test. After the dataset build
+publishes successfully, use the existing multi-runner rather than creating a
+dataset-specific training wrapper:
+
+```bash
+DATASET_ROOT=/home/alex/Development/Datasets/lerobot2/inspire/all_tasks_655eps_20260916_normals_range_mask_v2 \
+RUN_SUFFIX=all_tasks_655eps_20260916_normals_range_mask_v2 \
+EXPERIMENTS=normals \
+bash /home/alex/Development/scripts/multi_finetune_evaluation.sh
+```
+
+Use the same dataset/model variables with
+`partial_multi_finetune_evaluation.sh` when only evaluation must be resumed.
+
 `multi_finetune_evaluation.sh` runs each selected model as a complete
 train-then-validation-evaluate stage. Its default order is RGB, surface
 normals, then gray depth so the depth stage can be stopped without affecting
@@ -146,6 +223,15 @@ example, `EXPERIMENTS=rgb,normals`. Its Dex3 default prefers the canonical
 `lerobot2/dex3/` dataset when that dataset exists, otherwise it retains the
 legacy flat `lerobot2/` fallback during migration. An explicit `DATASET_ROOT`
 always takes precedence.
+
+The same launcher also has four opt-in Inspire late-fusion experiments:
+`rgbd_late_fusion_pre_adapter`, `rgbd_late_fusion_post_adapter`,
+`normals_late_fusion_pre_adapter`, and `normals_late_fusion_post_adapter`.
+They use the corresponding GR00T modality configs, keep the vision patch
+embedding frozen, and train the four 50/50-initialized linear fusion adapters.
+They are never included by the default `rgb,normals,depth` selection. The same
+names can be passed to `partial_multi_finetune_evaluation.sh` to evaluate a
+completed late-fusion training run without another dedicated runner.
 
 Passing the original `--source` to either command additionally rechecks exact
 raw-to-split provenance. `all` is the only mode that performs conversion and

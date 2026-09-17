@@ -10,8 +10,8 @@ STATUS=$LOG_ROOT/surface_normals_separate_patch_frozen_smoke_1608_1_status.tsv
 CONFIG=examples/UnitreeG1/g1_dex3_head_3_channel_surface_normals_config.py
 
 OUTPUTS=(
-    /home/alex/Development/Models/c_normals_separate_patch_frozen_bf16_batch_32_acc_1_chunk_32_1608_1_test
-    /home/alex/Development/Models/c_normals_separate_patch_frozen_bf16_batch_16_acc_2_chunk_32_1608_1_test
+    /home/alex/Development/Models/dex3/c_normals_separate_patch_frozen_bf16_batch_32_acc_1_chunk_32_1608_1_test
+    /home/alex/Development/Models/dex3/c_normals_separate_patch_frozen_bf16_batch_16_acc_2_chunk_32_1608_1_test
 )
 BATCH_SIZES=(32 16)
 ACCUMULATION_STEPS=(1 2)
@@ -52,6 +52,7 @@ for i in "${!OUTPUTS[@]}"; do
            --max-steps 1 \
            --save-steps 1 \
            --save-total-limit 1 \
+           --skip-final-model-save \
            --color-jitter-params \
                brightness 0.20 \
                contrast 0.15 \

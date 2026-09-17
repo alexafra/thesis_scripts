@@ -20,7 +20,7 @@ CONFIGS=(
 )
 
 OUTPUTS=(
-    /home/alex/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_zero_bf16_batch_32_acc_1_smoke_1708_2_test
+    /home/alex/Development/Models/dex3/c_normals_6ch_early_fusion_patch_tuned_normals_init_zero_bf16_batch_32_acc_1_smoke_1708_2_test
 )
 
 if ! uv run --no-sync python -m gr00t.data.stats \
@@ -62,6 +62,7 @@ for i in "${!CONFIGS[@]}"; do
            --max-steps 1 \
            --save-steps 1 \
            --save-total-limit 1 \
+           --skip-final-model-save \
            --color-jitter-params \
                brightness 0.20 \
                contrast 0.15 \

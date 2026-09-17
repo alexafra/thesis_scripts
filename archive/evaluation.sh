@@ -1,6 +1,6 @@
 cd "$HOME/Development/Isaac-GR00T"
 
-RUN_DIR="$HOME/Development/Models/gr00t_colour_only_batch_32_acc_1_0803_0930"
+RUN_DIR="$HOME/Development/Models/dex3/gr00t_colour_only_batch_32_acc_1_0803_0930"
 EVAL_DATASET="/home/alex/Development/Datasets/lerobot2/toothepaste_3107_test"
 TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/toothepaste_3107_train"
 
@@ -23,7 +23,7 @@ uv run --no-sync python scripts/analysis_tools/plot_training_history.py \
     --run-dir "$RUN_DIR" \
     --smooth-window 20
 
-RUN_DIR="$HOME/Development/Models/gr00t_gray_scale_batch_32_acc_1_0803_0930"
+RUN_DIR="$HOME/Development/Models/dex3/gr00t_gray_scale_batch_32_acc_1_0803_0930"
 
 CUDA_VISIBLE_DEVICES=0 \
 NO_ALBUMENTATIONS_UPDATE=1 \

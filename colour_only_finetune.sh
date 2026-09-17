@@ -1,7 +1,7 @@
 cd "$HOME/Development/Isaac-GR00T"
 
 TRAIN_DATASET="/home/alex/Development/Datasets/lerobot2/toothepaste_3107_train"
-TRAIN_DIR="$HOME/Development/Models/gr00t_colour_only_batch_32_acc_1_0803_0845"
+TRAIN_DIR="$HOME/Development/Models/dex3/gr00t_colour_only_batch_32_acc_1_0803_0845"
 
 echo "$TRAIN_DATASET"
 echo "$TRAIN_DIR"
@@ -29,4 +29,5 @@ uv run --no-sync python -m gr00t.experiment.launch_finetune \
     --learning-rate 1e-4 \
     --max-steps 5000 \
     --save-steps 1000 \
-    --save-total-limit 5
+    --save-total-limit 5 \
+    --skip-final-model-save

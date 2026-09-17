@@ -15,8 +15,8 @@ MODALITY_CONFIGS=(
 )
 
 MODEL_DIRS=(
-    # "$HOME/Development/Models/c_d1_batch_32_acc_1_1008_1"
-    "$HOME/Development/Models/c_only_batch_32_acc_1_chunk_16_1008"
+    # "$HOME/Development/Models/dex3/c_d1_batch_32_acc_1_1008_1"
+    "$HOME/Development/Models/dex3/c_only_batch_32_acc_1_chunk_16_1008"
 )
 
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ]]; then

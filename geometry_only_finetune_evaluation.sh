@@ -10,7 +10,7 @@ DATASET_ROOT="${DATASET_ROOT:-/home/alex/Development/Datasets/lerobot2/atomic_co
 TRAIN_DATASET="${TRAIN_DATASET:-$DATASET_ROOT/train}"
 VALIDATION_DATASET="${VALIDATION_DATASET:-$DATASET_ROOT/validation}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-/home/alex/Development/Models/GR00T-N1.7-3B}"
-MODEL_ROOT="${MODEL_ROOT:-/home/alex/Development/Models}"
+MODEL_ROOT="${MODEL_ROOT:-/home/alex/Development/Models/dex3}"
 LOG_ROOT="${LOG_ROOT:-/home/alex/Development/logs/groot/training}"
 VISUAL_MODE="${VISUAL_MODE:-depth}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -244,7 +244,8 @@ if CUDA_VISIBLE_DEVICES=0 \
        --warmup-ratio 0.05 \
        --max-steps "$MAX_STEPS" \
        --save-steps "$SAVE_STEPS" \
-       --save-total-limit 8; then
+       --save-total-limit 8 \
+       --skip-final-model-save; then
     printf 'training\t%s\tPASS\t0\n' "$MODEL_DIR" >> "$STATUS_FILE"
 else
     exit_code=$?

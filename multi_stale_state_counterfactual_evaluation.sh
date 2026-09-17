@@ -42,9 +42,9 @@ else
 fi
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/c_rgb_patch_tuned_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
-    "$HOME/Development/Models/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
+    "$HOME/Development/Models/dex3/c_rgb_patch_tuned_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
+    "$HOME/Development/Models/dex3/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
+    "$HOME/Development/Models/dex3/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
 )
 INCLUDE_BASE_MODEL=(1 0 0)
 

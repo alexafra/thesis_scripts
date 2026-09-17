@@ -51,11 +51,13 @@ DATASET_ROBOT_TYPE="$(
 case "$DATASET_ROBOT_TYPE" in
     Unitree_G1_Inspire_HeadOnly)
         DEFAULT_MODEL_PREFIX="inspire_"
+        DEFAULT_MODEL_ROOT="$HOME/Development/Models/inspire"
         CONFIG_PREFIX="g1_inspire"
         DEFAULT_RUN_SUFFIX="$(basename "$DATASET_ROOT")_$(date -u +%Y%m%d)"
         ;;
     Unitree_G1_Dex3_HeadOnly)
         DEFAULT_MODEL_PREFIX=""
+        DEFAULT_MODEL_ROOT="$HOME/Development/Models/dex3"
         CONFIG_PREFIX="g1_dex3"
         DEFAULT_RUN_SUFFIX="three_cups_rightonly_1408_stack_0908_$(date -u +%Y%m%d)"
         ;;
@@ -66,6 +68,7 @@ case "$DATASET_ROBOT_TYPE" in
 esac
 
 RUN_SUFFIX="${RUN_SUFFIX:-$DEFAULT_RUN_SUFFIX}"
+MODEL_ROOT="${MODEL_ROOT:-$DEFAULT_MODEL_ROOT}"
 MODEL_PREFIX="${MODEL_PREFIX:-$DEFAULT_MODEL_PREFIX}"
 [[ "$MODEL_PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] || {
     echo "Error: invalid MODEL_PREFIX: $MODEL_PREFIX" >&2
@@ -92,6 +95,10 @@ else
     echo "Error: DRY_RUN must be 0 or 1." >&2
     exit 1
 fi
+if (( MAX_STEPS % SAVE_STEPS != 0 )); then
+    echo "Error: MAX_STEPS must be divisible by SAVE_STEPS so the final weights exist as a checkpoint." >&2
+    exit 1
+fi
 
 EVALUATION_STATUS_FILE="${EVALUATION_STATUS_FILE:-$LOG_ROOT/multi_finetune_evaluation_${RUN_LABEL}_${RUN_SUFFIX}_evaluation_status.tsv}"
 TRAINING_FAILURES=()
@@ -101,26 +108,46 @@ MODALITY_CONFIGS=(
     "examples/UnitreeG1/${CONFIG_PREFIX}_headonly_config.py"
     "examples/UnitreeG1/${CONFIG_PREFIX}_head_4_channel_gray_depth_fusion_config.py"
     "examples/UnitreeG1/${CONFIG_PREFIX}_head_6_channel_surface_normals_fusion_config.py"
+    "examples/UnitreeG1/g1_inspire_head_rgbd_late_fusion_pre_adapter_config.py"
+    "examples/UnitreeG1/g1_inspire_head_rgbd_late_fusion_post_adapter_config.py"
+    "examples/UnitreeG1/g1_inspire_head_rgb_surface_normals_late_fusion_pre_adapter_config.py"
+    "examples/UnitreeG1/g1_inspire_head_rgb_surface_normals_late_fusion_post_adapter_config.py"
 )
 
 MODEL_DIRS=(
-    "$HOME/Development/Models/${MODEL_PREFIX}c_rgb_patch_tuned_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/${MODEL_PREFIX}c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
-    "$HOME/Development/Models/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgb_patch_tuned_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgb_surface_normals_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgb_surface_normals_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
 )
 
 PATCH_EMBED_FLAGS=(
     "--tune-vision-patch-embed"
     "--tune-vision-patch-embed"
     "--tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
 )
 
-LOAD_BF16_FLAGS=(1 1 1)
-BATCH_SIZES=(32 32 32)
-ACCUMULATION_STEPS=(1 1 1)
-PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean")
-INCLUDE_BASE_MODEL=(1 0 0)
-EXPERIMENT_NAMES=(rgb depth normals)
+LOAD_BF16_FLAGS=(1 1 1 1 1 1 1)
+BATCH_SIZES=(32 32 32 32 32 32 32)
+ACCUMULATION_STEPS=(1 1 1 1 1 1 1)
+PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean" "" "" "" "")
+INCLUDE_BASE_MODEL=(1 0 0 0 0 0 0)
+EXPERIMENT_NAMES=(
+    rgb
+    depth
+    normals
+    rgbd_late_fusion_pre_adapter
+    rgbd_late_fusion_post_adapter
+    normals_late_fusion_pre_adapter
+    normals_late_fusion_post_adapter
+)
 
 SELECTED_INDICES=()
 SELECTED_EXPERIMENTS=()
@@ -131,8 +158,13 @@ for experiment in "${REQUESTED_EXPERIMENTS[@]}"; do
         rgb) index=0 ;;
         depth) index=1 ;;
         normals) index=2 ;;
+        rgbd_late_fusion_pre_adapter) index=3 ;;
+        rgbd_late_fusion_post_adapter) index=4 ;;
+        normals_late_fusion_pre_adapter) index=5 ;;
+        normals_late_fusion_post_adapter) index=6 ;;
         *)
-            echo "Error: EXPERIMENTS entries must be rgb, depth, or normals; got: $experiment" >&2
+            echo "Error: unsupported EXPERIMENTS entry: $experiment" >&2
+            echo "Supported: ${EXPERIMENT_NAMES[*]}" >&2
             exit 1
             ;;
     esac
@@ -149,6 +181,15 @@ if [[ ${#SELECTED_INDICES[@]} -eq 0 ]]; then
     exit 1
 fi
 
+if [[ "$DATASET_ROBOT_TYPE" != "Unitree_G1_Inspire_HeadOnly" ]]; then
+    for experiment in "${SELECTED_EXPERIMENTS[@]}"; do
+        if [[ "$experiment" == *_late_fusion_* ]]; then
+            echo "Error: $experiment currently has an Inspire-only modality config." >&2
+            exit 1
+        fi
+    done
+fi
+
 if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#PATCH_EMBED_FLAGS[@]} ||
       ${#MODALITY_CONFIGS[@]} -ne ${#LOAD_BF16_FLAGS[@]} ||
@@ -162,10 +203,14 @@ if [[ ${#MODALITY_CONFIGS[@]} -ne ${#MODEL_DIRS[@]} ||
 fi
 
 REQUIRED_FEATURES=(observation.images.ego_view)
-if [[ -n "${SELECTED_EXPERIMENT_SET[depth]:-}" ]]; then
+if [[ -n "${SELECTED_EXPERIMENT_SET[depth]:-}" ||
+      -n "${SELECTED_EXPERIMENT_SET[rgbd_late_fusion_pre_adapter]:-}" ||
+      -n "${SELECTED_EXPERIMENT_SET[rgbd_late_fusion_post_adapter]:-}" ]]; then
     REQUIRED_FEATURES+=(observation.images.depth_gray_view)
 fi
-if [[ -n "${SELECTED_EXPERIMENT_SET[normals]:-}" ]]; then
+if [[ -n "${SELECTED_EXPERIMENT_SET[normals]:-}" ||
+      -n "${SELECTED_EXPERIMENT_SET[normals_late_fusion_pre_adapter]:-}" ||
+      -n "${SELECTED_EXPERIMENT_SET[normals_late_fusion_post_adapter]:-}" ]]; then
     REQUIRED_FEATURES+=(observation.images.surface_normals_view)
 fi
 
@@ -235,6 +280,7 @@ PY
 
 echo "Dataset root:       $DATASET_ROOT"
 echo "Dataset robot type: $DATASET_ROBOT_TYPE"
+echo "Model root:         $MODEL_ROOT"
 echo "Model prefix:       ${MODEL_PREFIX:-<none>}"
 echo "Experiments:        ${SELECTED_EXPERIMENTS[*]}"
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
@@ -314,6 +360,7 @@ for i in "${SELECTED_INDICES[@]}"; do
            --max-steps "$MAX_STEPS" \
            --save-steps "$SAVE_STEPS" \
            --save-total-limit 8 \
+           --skip-final-model-save \
            --color-jitter-params \
                brightness 0.20 \
                contrast 0.15 \
@@ -363,15 +410,23 @@ for i in "${SELECTED_INDICES[@]}"; do
            --denoising-steps 4 \
            --inference-seed 42 \
            --modality-keys left_arm right_arm left_hand right_hand \
-           --train-probe-seed 42; then
+           --train-probe-seed 42 &&
+       # Consume the complete saved frame-level predictions without rewriting them.
+       uv run --no-sync python -m scripts.analysis_tools.normalized_action_metrics \
+           --run-dir "$MODEL_DIR" \
+           --evaluation-dir "$MODEL_DIR/evaluation_exec_hor_${EXECUTION_HORIZON}" \
+           --output-dir "$MODEL_DIR/normalized_action_metrics_exec_hor_${EXECUTION_HORIZON}" \
+           --statistics-path "$MODEL_DIR/experiment_cfg/dataset_statistics.json" \
+           --embodiment-tag NEW_EMBODIMENT \
+           --execution-horizon "$EXECUTION_HORIZON"; then
         printf 'evaluation\t%s\tPASS\t0\n' "$MODEL_DIR" >> "$EVALUATION_STATUS_FILE"
-        echo "Finished evaluation: $MODEL_DIR"
+        echo "Finished evaluation and normalized action metrics: $MODEL_DIR"
     else
         evaluation_exit_code=$?
         printf 'evaluation\t%s\tFAIL\t%d\n' \
             "$MODEL_DIR" "$evaluation_exit_code" >> "$EVALUATION_STATUS_FILE"
         EVALUATION_FAILURES+=("$MODEL_DIR (exit $evaluation_exit_code)")
-        echo "WARNING: evaluation failed for $MODEL_DIR; continuing to the next training run." >&2
+        echo "WARNING: evaluation or normalized metrics failed for $MODEL_DIR; continuing to the next training run." >&2
     fi
 done
 
