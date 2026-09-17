@@ -3,9 +3,9 @@
 
 It evaluates paired observations whose RGB, robot state, language, target
 actions, diffusion noise, and inference frame are identical.  The intervention
-changes only ``depth_gray_view`` or ``surface_normals_view`` using one of three
-controls: a same-task donor at matched progress, that donor shifted by half an
-episode, or an all-zero geometry frame.
+changes only ``depth_gray_view`` or ``surface_normals_view`` using a same-task
+cross-episode donor, a same-episode temporal offset, or an all-zero geometry
+frame.
 
 Dataset files are read-only.  Geometry replacement happens only in memory.
 Positive counterfactual-minus-intact error means the intact geometry helped
@@ -47,7 +47,13 @@ import torch
 
 LOGGER = logging.getLogger("geometry_correspondence_evaluation")
 GEOMETRY_KEYS = ("depth_gray_view", "surface_normals_view")
-INTERVENTIONS = ("phase_matched", "out_of_phase", "zero_geometry")
+CROSS_EPISODE_INTERVENTIONS = ("phase_matched", "out_of_phase")
+SAME_EPISODE_OFFSETS = {"offset_10pct": 0.10, "offset_50pct": 0.50}
+INTERVENTIONS = (
+    *CROSS_EPISODE_INTERVENTIONS,
+    *SAME_EPISODE_OFFSETS,
+    "zero_geometry",
+)
 CONDITIONS = ("intact", "counterfactual")
 
 
@@ -93,7 +99,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry-key", choices=GEOMETRY_KEYS, required=True)
-    parser.add_argument("--intervention", choices=INTERVENTIONS, default="phase_matched")
+    parser.add_argument(
+        "--intervention", choices=INTERVENTIONS, default="phase_matched"
+    )
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
     parser.add_argument("--checkpoint-steps", type=int, nargs="*")
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
@@ -157,7 +165,9 @@ def checkpoint_step(path: Path) -> int:
     return int(match.group(1))
 
 
-def find_targets(run_dir: Path, selected_steps: list[int] | None) -> list[EvaluationTarget]:
+def find_targets(
+    run_dir: Path, selected_steps: list[int] | None
+) -> list[EvaluationTarget]:
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Training run does not exist: {run_dir}")
     if re.fullmatch(r"checkpoint-\d+", run_dir.name):
@@ -183,12 +193,18 @@ def find_targets(run_dir: Path, selected_steps: list[int] | None) -> list[Evalua
 
 
 def _stable_seed(base_seed: int, *parts: Any) -> int:
-    payload = json.dumps([int(base_seed), *parts], sort_keys=True, default=str).encode("utf-8")
-    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2**63)
+    payload = json.dumps([int(base_seed), *parts], sort_keys=True, default=str).encode(
+        "utf-8"
+    )
+    return int.from_bytes(
+        hashlib.blake2b(payload, digest_size=8).digest(), "little"
+    ) % (2**63)
 
 
 def _task_tuple(metadata: dict[str, Any]) -> tuple[str, ...]:
-    tasks = tuple(dict.fromkeys(str(task) for task in metadata.get("tasks", []) if str(task)))
+    tasks = tuple(
+        dict.fromkeys(str(task) for task in metadata.get("tasks", []) if str(task))
+    )
     if not tasks:
         raise ValueError(f"Episode {metadata.get('episode_index')} has no task text")
     return tasks
@@ -201,7 +217,9 @@ def _task_label(tasks: tuple[str, ...]) -> str:
 def _provenance_map(dataset_path: Path, split: str) -> dict[int, dict[str, Any]]:
     path = dataset_path.parent / "provenance" / "merge_manifest.json"
     if not path.is_file():
-        LOGGER.warning("No merge provenance manifest at %s; all episodes labelled base", path)
+        LOGGER.warning(
+            "No merge provenance manifest at %s; all episodes labelled base", path
+        )
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     result = {}
@@ -314,7 +332,9 @@ def donor_progress_for_phase(
     if target_length <= 0:
         raise ValueError("Episode lengths must be positive")
     if not 0 <= target_frame < target_length:
-        raise IndexError(f"Target frame {target_frame} is outside 0..{target_length - 1}")
+        raise IndexError(
+            f"Target frame {target_frame} is outside 0..{target_length - 1}"
+        )
     target_progress = target_frame / (target_length - 1) if target_length > 1 else 0.0
     if donor_phase == "phase_matched":
         return target_progress
@@ -343,7 +363,9 @@ def donor_frame_for_phase(
     return min(max(mapped, 0), donor_length - 1)
 
 
-def phase_matched_frame(target_frame: int, target_length: int, donor_length: int) -> int:
+def phase_matched_frame(
+    target_frame: int, target_length: int, donor_length: int
+) -> int:
     return donor_frame_for_phase(
         target_frame,
         target_length,
@@ -352,13 +374,66 @@ def phase_matched_frame(target_frame: int, target_length: int, donor_length: int
     )
 
 
+def same_episode_progress_for_offset(
+    target_frame: int,
+    target_length: int,
+    *,
+    intervention: str,
+) -> float:
+    """Return normalized progress for a discrete circular same-episode shift."""
+
+    mapped_frame = same_episode_frame_for_offset(
+        target_frame,
+        target_length,
+        intervention=intervention,
+    )
+    return mapped_frame / (target_length - 1) if target_length > 1 else 0.0
+
+
+def same_episode_shift_frames(target_length: int, *, intervention: str) -> int:
+    """Resolve a fractional episode offset to its nearest integer frame shift."""
+
+    if target_length <= 0:
+        raise ValueError("Episode lengths must be positive")
+    try:
+        offset = SAME_EPISODE_OFFSETS[intervention]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown same-episode offset intervention: {intervention}"
+        ) from exc
+    return int(round(offset * target_length))
+
+
+def same_episode_frame_for_offset(
+    target_frame: int,
+    target_length: int,
+    *,
+    intervention: str,
+) -> int:
+    """Return the same-episode frame after a discrete circular frame shift."""
+
+    if target_length <= 0:
+        raise ValueError("Episode lengths must be positive")
+    if not 0 <= target_frame < target_length:
+        raise IndexError(
+            f"Target frame {target_frame} is outside 0..{target_length - 1}"
+        )
+    shift = same_episode_shift_frames(
+        target_length,
+        intervention=intervention,
+    )
+    return (target_frame + shift) % target_length
+
+
 def _validate_contract(
     modality: dict[str, ModalityConfig],
     *,
     geometry_key: str,
     execution_horizon: int,
 ) -> int:
-    spec = PolicyHorizonSpec.from_modality_config(modality, n_action_steps=execution_horizon)
+    spec = PolicyHorizonSpec.from_modality_config(
+        modality, n_action_steps=execution_horizon
+    )
     video = modality.get("video")
     if video is None:
         raise ValueError("Policy has no video modality")
@@ -439,7 +514,9 @@ def replace_geometry(
     replaced = dict(flat)
     replaced[column] = replacement
     if any(replaced[key] is not value for key, value in flat.items() if key != column):
-        raise RuntimeError("Geometry intervention copied or changed a non-geometry input")
+        raise RuntimeError(
+            "Geometry intervention copied or changed a non-geometry input"
+        )
     return replaced
 
 
@@ -473,7 +550,12 @@ def _stack_columns(frame: pd.DataFrame, prefix: str, keys: Iterable[str]) -> np.
         if column not in frame:
             raise ValueError(f"Episode is missing {column}")
         arrays.append(
-            np.vstack([np.asarray(value, dtype=np.float64).reshape(-1) for value in frame[column]])
+            np.vstack(
+                [
+                    np.asarray(value, dtype=np.float64).reshape(-1)
+                    for value in frame[column]
+                ]
+            )
         )
     values = np.concatenate(arrays, axis=1)
     if not np.all(np.isfinite(values)):
@@ -507,7 +589,9 @@ def _action_schema(
     return actions, labels, groups
 
 
-def _chunk_array(chunks: dict[str, Any], batch_index: int, action_keys: list[str]) -> np.ndarray:
+def _chunk_array(
+    chunks: dict[str, Any], batch_index: int, action_keys: list[str]
+) -> np.ndarray:
     arrays = []
     horizon = None
     for key in action_keys:
@@ -526,7 +610,9 @@ def _chunk_array(chunks: dict[str, Any], batch_index: int, action_keys: list[str
     return result
 
 
-def _error_metrics(prediction: np.ndarray, expert: np.ndarray) -> dict[str, float | int]:
+def _error_metrics(
+    prediction: np.ndarray, expert: np.ndarray
+) -> dict[str, float | int]:
     prediction = np.asarray(prediction, dtype=np.float64)
     expert = np.asarray(expert, dtype=np.float64)
     if prediction.shape != expert.shape or prediction.size == 0:
@@ -613,12 +699,40 @@ def _evaluate_checkpoint(
             assignment = assignments.get(recipient.loader_position)
             donor_trajectory = None
             donor_frames: dict[int, int] = {}
+            replacement_episode_index = None
             if intervention == "zero_geometry":
                 if assignment is not None or donor_loader is not None:
-                    raise RuntimeError("zero_geometry must not construct or decode donors")
+                    raise RuntimeError(
+                        "zero_geometry must not construct or decode donors"
+                    )
+            elif intervention in SAME_EPISODE_OFFSETS:
+                if assignment is not None or donor_loader is None:
+                    raise RuntimeError(
+                        f"{intervention} requires no donor assignment and a geometry loader"
+                    )
+                donor_frames = {
+                    anchor: same_episode_frame_for_offset(
+                        anchor,
+                        recipient.length,
+                        intervention=intervention,
+                    )
+                    for anchor in anchors
+                }
+                donor_trajectory = donor_loader.load_episode(
+                    recipient.loader_position,
+                    frame_indices=sorted(set(donor_frames.values())),
+                )
+                if len(donor_trajectory) != recipient.length:
+                    raise ValueError(
+                        f"Same-episode geometry length for episode {recipient.episode_index} "
+                        f"was {len(donor_trajectory)}, expected {recipient.length}"
+                    )
+                replacement_episode_index = recipient.episode_index
             else:
                 if assignment is None or donor_loader is None:
-                    raise RuntimeError(f"{intervention} requires a donor assignment and loader")
+                    raise RuntimeError(
+                        f"{intervention} requires a donor assignment and loader"
+                    )
                 donor_record = record_by_position[assignment.donor_loader_position]
                 donor_frames = {
                     anchor: donor_frame_for_phase(
@@ -638,6 +752,7 @@ def _evaluate_checkpoint(
                         f"Donor episode {donor_record.episode_index} metadata length "
                         f"{donor_record.length} != loaded length {len(donor_trajectory)}"
                     )
+                replacement_episode_index = assignment.donor_episode_index
 
             episode_expert = []
             episode_intact = []
@@ -650,31 +765,40 @@ def _evaluate_checkpoint(
                 seeds = []
                 for anchor in batch_anchors:
                     if intervention == "zero_geometry":
-                        target_value = target_trajectory[f"video.{geometry_key}"].iloc[anchor]
+                        target_value = target_trajectory[f"video.{geometry_key}"].iloc[
+                            anchor
+                        ]
                         if target_value is None:
-                            raise ValueError(f"Target geometry was not decoded for frame {anchor}")
+                            raise ValueError(
+                                f"Target geometry was not decoded for frame {anchor}"
+                            )
                         replacement_frame = zero_geometry_frame(target_value)
                     else:
                         assert donor_trajectory is not None
-                        replacement_frame = donor_trajectory[f"video.{geometry_key}"].iloc[
-                            donor_frames[anchor]
-                        ]
+                        replacement_frame = donor_trajectory[
+                            f"video.{geometry_key}"
+                        ].iloc[donor_frames[anchor]]
                         if replacement_frame is None:
                             raise ValueError(
-                                f"Donor geometry was not decoded for frame {donor_frames[anchor]}"
+                                "Replacement geometry was not decoded for frame "
+                                f"{donor_frames[anchor]}"
                             )
-                    intact_observation, counterfactual_observation = _paired_observations(
-                        target_trajectory=target_trajectory,
-                        target_frame=anchor,
-                        replacement_frame=replacement_frame,
-                        modality=modality,
-                        embodiment_tag=embodiment_tag,
-                        geometry_key=geometry_key,
+                    intact_observation, counterfactual_observation = (
+                        _paired_observations(
+                            target_trajectory=target_trajectory,
+                            target_frame=anchor,
+                            replacement_frame=replacement_frame,
+                            modality=modality,
+                            embodiment_tag=embodiment_tag,
+                            geometry_key=geometry_key,
+                        )
                     )
                     noise_seed = _stable_seed(
                         inference_seed, split, recipient.episode_index, anchor, repeat
                     )
-                    observations.extend((intact_observation, counterfactual_observation))
+                    observations.extend(
+                        (intact_observation, counterfactual_observation)
+                    )
                     seeds.extend((noise_seed, noise_seed))
                 chunks, _ = policy.get_action(
                     batch_policy_observations(observations),
@@ -682,10 +806,12 @@ def _evaluate_checkpoint(
                 )
                 for batch_index, anchor in enumerate(batch_anchors):
                     window = min(execution_horizon, recipient.length - anchor)
-                    intact_chunk = _chunk_array(chunks, batch_index * 2, action_keys)[:window]
-                    counterfactual_chunk = _chunk_array(chunks, batch_index * 2 + 1, action_keys)[
+                    intact_chunk = _chunk_array(chunks, batch_index * 2, action_keys)[
                         :window
                     ]
+                    counterfactual_chunk = _chunk_array(
+                        chunks, batch_index * 2 + 1, action_keys
+                    )[:window]
                     expert = actions[anchor : anchor + window]
                     if (
                         intact_chunk.shape != expert.shape
@@ -700,7 +826,9 @@ def _evaluate_checkpoint(
                     episode_expert.append(expert)
                     episode_intact.append(intact_chunk)
                     episode_counterfactual.append(counterfactual_chunk)
-                    episode_frames.append(np.arange(anchor, anchor + window, dtype=np.int64))
+                    episode_frames.append(
+                        np.arange(anchor, anchor + window, dtype=np.int64)
+                    )
                     episode_horizon_positions.append(np.arange(window, dtype=np.int64))
 
             expert = np.concatenate(episode_expert, axis=0)
@@ -724,9 +852,7 @@ def _evaluate_checkpoint(
                 "source": recipient.source,
                 "source_episode": recipient.source_episode,
                 "intervention": intervention,
-                "donor_episode_index": (
-                    assignment.donor_episode_index if assignment is not None else None
-                ),
+                "donor_episode_index": replacement_episode_index,
             }
             for group_name, indices in groups.items():
                 intact_metrics = _error_metrics(intact[:, indices], expert[:, indices])
@@ -745,7 +871,9 @@ def _evaluate_checkpoint(
                         **base,
                         "group": group_name,
                         "sample_count": intact_metrics["sample_count"],
-                        "intact_sum_absolute_error": intact_metrics["sum_absolute_error"],
+                        "intact_sum_absolute_error": intact_metrics[
+                            "sum_absolute_error"
+                        ],
                         "counterfactual_sum_absolute_error": counterfactual_metrics[
                             "sum_absolute_error"
                         ],
@@ -771,11 +899,15 @@ def _evaluate_checkpoint(
             raw["expert"].append(expert.astype(np.float32))
             raw["intact"].append(intact.astype(np.float32))
             raw["counterfactual"].append(counterfactual.astype(np.float32))
-            raw["episode_index"].append(np.full(row_count, recipient.episode_index, dtype=np.int32))
+            raw["episode_index"].append(
+                np.full(row_count, recipient.episode_index, dtype=np.int32)
+            )
             raw["donor_episode_index"].append(
                 np.full(
                     row_count,
-                    assignment.donor_episode_index if assignment is not None else -1,
+                    replacement_episode_index
+                    if replacement_episode_index is not None
+                    else -1,
                     dtype=np.int32,
                 )
             )
@@ -908,10 +1040,14 @@ def summarize_joints(
                 "joint": joint,
                 "intact_mae": intact["mae"],
                 "counterfactual_mae": counterfactual["mae"],
-                "delta_mae_counterfactual_minus_intact": (counterfactual["mae"] - intact["mae"]),
+                "delta_mae_counterfactual_minus_intact": (
+                    counterfactual["mae"] - intact["mae"]
+                ),
                 "intact_mse": intact["mse"],
                 "counterfactual_mse": counterfactual["mse"],
-                "delta_mse_counterfactual_minus_intact": (counterfactual["mse"] - intact["mse"]),
+                "delta_mse_counterfactual_minus_intact": (
+                    counterfactual["mse"] - intact["mse"]
+                ),
                 **_prediction_change(arrays["intact"], arrays["counterfactual"], index),
             }
         )
@@ -961,9 +1097,12 @@ def summarize_paired_effects(
     if len(interventions) != 1:
         raise ValueError(f"Expected one intervention, got {interventions}")
     intervention = str(interventions[0])
-    scopes: list[tuple[str, str, pd.DataFrame]] = [("all_tasks", "all", episode_effects)]
+    scopes: list[tuple[str, str, pd.DataFrame]] = [
+        ("all_tasks", "all", episode_effects)
+    ]
     scopes.extend(
-        ("task", str(value), group) for value, group in episode_effects.groupby("task", sort=True)
+        ("task", str(value), group)
+        for value, group in episode_effects.groupby("task", sort=True)
     )
     scopes.extend(
         ("cohort", str(value), group)
@@ -1031,8 +1170,12 @@ def summarize_paired_effects(
                         )
                         / sample_count
                     ),
-                    "episode_macro_mean_delta_mae": float(per_episode["delta_mae"].mean()),
-                    "episode_macro_median_delta_mae": float(per_episode["delta_mae"].median()),
+                    "episode_macro_mean_delta_mae": float(
+                        per_episode["delta_mae"].mean()
+                    ),
+                    "episode_macro_median_delta_mae": float(
+                        per_episode["delta_mae"].median()
+                    ),
                     "task_balanced_mean_delta_mae": float(task_means.mean()),
                     "task_balanced_delta_mae_ci95_low": low,
                     "task_balanced_delta_mae_ci95_high": high,
@@ -1064,6 +1207,15 @@ def _donor_manifest(
                 "replacement": "all-zero frame with target shape and dtype",
             }
         ]
+    if intervention in SAME_EPISODE_OFFSETS:
+        return [
+            {
+                "intervention": intervention,
+                "donor_required": False,
+                "replacement": "same-episode geometry with a circular integer-frame shift",
+                "phase_offset_fraction": SAME_EPISODE_OFFSETS[intervention],
+            }
+        ]
     return [
         {"intervention": intervention, "donor_required": True, **asdict(assignment)}
         for _repeat, assignments in sorted(assignments_by_repeat.items())
@@ -1088,15 +1240,37 @@ def _frame_mapping(
                 )
                 if intervention == "zero_geometry":
                     if assignment is not None:
-                        raise RuntimeError("zero_geometry must not have donor assignments")
+                        raise RuntimeError(
+                            "zero_geometry must not have donor assignments"
+                        )
                     donor_progress = None
                     donor_frame = None
                     donor_episode_index = None
                     donor_length = None
                     replacement_source = "all_zeros"
+                elif intervention in SAME_EPISODE_OFFSETS:
+                    if assignment is not None:
+                        raise RuntimeError(
+                            f"{intervention} must not have a cross-episode donor assignment"
+                        )
+                    donor_progress = same_episode_progress_for_offset(
+                        anchor,
+                        recipient.length,
+                        intervention=intervention,
+                    )
+                    donor_frame = same_episode_frame_for_offset(
+                        anchor,
+                        recipient.length,
+                        intervention=intervention,
+                    )
+                    donor_episode_index = recipient.episode_index
+                    donor_length = recipient.length
+                    replacement_source = "same_episode"
                 else:
                     if assignment is None:
-                        raise RuntimeError(f"{intervention} is missing a donor assignment")
+                        raise RuntimeError(
+                            f"{intervention} is missing a donor assignment"
+                        )
                     donor_progress = donor_progress_for_phase(
                         anchor,
                         recipient.length,
@@ -1196,7 +1370,9 @@ def _modality_signature(modality: dict[str, ModalityConfig]) -> dict[str, Any]:
         name: {
             "keys": [str(key) for key in config.modality_keys],
             "delta_indices": [int(value) for value in config.delta_indices],
-            "vision_channel_layout": (config.vision_channel_layout if name == "video" else None),
+            "vision_channel_layout": (
+                config.vision_channel_layout if name == "video" else None
+            ),
         }
         for name, config in modality.items()
     }
@@ -1205,7 +1381,9 @@ def _modality_signature(modality: dict[str, ModalityConfig]) -> dict[str, Any]:
 def validate_heldout_dataset_path(dataset_path: Path, split: str) -> Path:
     resolved = dataset_path.resolve()
     if split not in {"validation", "test"}:
-        raise ValueError(f"Only held-out validation/test splits are allowed, got {split!r}")
+        raise ValueError(
+            f"Only held-out validation/test splits are allowed, got {split!r}"
+        )
     if resolved.name != split:
         raise ValueError(
             f"--dataset-path must resolve to the named held-out split {split!r}; got {resolved}"
@@ -1221,7 +1399,8 @@ def _run_metadata(
     elapsed_seconds: float,
 ) -> dict[str, Any]:
     arguments = {
-        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
     }
     dataset_meta = args.dataset_path / "meta"
     merge_manifest = args.dataset_path.parent / "provenance" / "merge_manifest.json"
@@ -1231,17 +1410,41 @@ def _run_metadata(
         intervention_detail = {
             "name": args.intervention,
             "replacement": "same-task cross-episode donor geometry",
-            "donor_rule": ("different episode, exact same task, deterministic cyclic derangement"),
+            "donor_rule": (
+                "different episode, exact same task, deterministic cyclic derangement"
+            ),
             "frame_rule": "donor_progress = recipient_progress",
-            "caveat": ("normalized episode progress is approximate, not semantic phase alignment"),
+            "caveat": (
+                "normalized episode progress is approximate, not semantic phase alignment"
+            ),
         }
     elif args.intervention == "out_of_phase":
         intervention_detail = {
             "name": args.intervention,
             "replacement": "same-task cross-episode donor geometry",
-            "donor_rule": ("different episode, exact same task, deterministic cyclic derangement"),
+            "donor_rule": (
+                "different episode, exact same task, deterministic cyclic derangement"
+            ),
             "frame_rule": "donor_progress = (recipient_progress + 0.5) modulo 1",
-            "caveat": ("the half-episode shift deliberately destroys phase correspondence"),
+            "caveat": (
+                "the half-episode shift deliberately destroys phase correspondence"
+            ),
+        }
+    elif args.intervention in SAME_EPISODE_OFFSETS:
+        offset = SAME_EPISODE_OFFSETS[args.intervention]
+        intervention_detail = {
+            "name": args.intervention,
+            "replacement": "geometry from the same episode after a circular frame shift",
+            "donor_rule": "same episode as the intact observation",
+            "frame_rule": (
+                "replacement_frame = (recipient_frame + "
+                f"round({offset:.2f} * episode_length)) modulo episode_length"
+            ),
+            "phase_offset_fraction": offset,
+            "caveat": (
+                "the integer circular shift wraps near the episode end and intentionally breaks "
+                "instantaneous RGB/geometry correspondence"
+            ),
         }
     elif args.intervention == "zero_geometry":
         intervention_detail = {
@@ -1257,7 +1460,7 @@ def _run_metadata(
     else:
         raise ValueError(f"Unknown intervention: {args.intervention}")
     return {
-        "version": 2,
+        "version": 3,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_seconds,
         "offline_only": True,
@@ -1346,7 +1549,9 @@ def main(argv: list[str] | None = None) -> int:
                 execution_horizon=args.execution_horizon,
             )
             signature = _modality_signature(modality)
-            target_loader = LeRobotEpisodeLoader(args.dataset_path, modality_configs=modality)
+            target_loader = LeRobotEpisodeLoader(
+                args.dataset_path, modality_configs=modality
+            )
             donor_loader = (
                 None
                 if args.intervention == "zero_geometry"
@@ -1357,10 +1562,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             if canonical_signature is None:
                 canonical_signature = signature
-                records = episode_records(target_loader, split=args.split, tasks=args.task)
+                records = episode_records(
+                    target_loader, split=args.split, tasks=args.task
+                )
                 selected_records = records[: args.max_episodes or None]
-                if args.intervention == "zero_geometry":
-                    assignments_by_repeat = {repeat: {} for repeat in range(args.shuffle_repeats)}
+                if args.intervention not in CROSS_EPISODE_INTERVENTIONS:
+                    assignments_by_repeat = {
+                        repeat: {} for repeat in range(args.shuffle_repeats)
+                    }
                 else:
                     assignments_by_repeat = {
                         repeat: build_donor_assignments(
@@ -1376,7 +1585,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 _write_csv(
                     args.output_dir / "donor_manifest.csv",
-                    _donor_manifest(assignments_by_repeat, intervention=args.intervention),
+                    _donor_manifest(
+                        assignments_by_repeat, intervention=args.intervention
+                    ),
                 )
                 _write_csv(
                     args.output_dir / "frame_mapping.csv",
@@ -1388,7 +1599,9 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 )
             elif signature != canonical_signature:
-                raise ValueError("Checkpoint modality contract changed within this evaluation")
+                raise ValueError(
+                    "Checkpoint modality contract changed within this evaluation"
+                )
 
             checkpoint_dir = args.output_dir / f"checkpoint-{target.step}"
             checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -1422,17 +1635,23 @@ def main(argv: list[str] | None = None) -> int:
                 bootstrap_replicates=args.bootstrap_replicates,
                 bootstrap_seed=args.shuffle_seed,
             )
-            _write_csv(checkpoint_dir / "episode_condition_metrics.csv", episode_condition)
+            _write_csv(
+                checkpoint_dir / "episode_condition_metrics.csv", episode_condition
+            )
             _write_csv(checkpoint_dir / "paired_episode_effects.csv", episode_pair)
             _write_csv(checkpoint_dir / "condition_summary.csv", condition_summary)
             _write_csv(checkpoint_dir / "paired_summary.csv", paired_summary)
             _write_csv(
                 checkpoint_dir / "horizon_metrics.csv",
-                summarize_horizon(arrays, checkpoint_step_value=target.step, split=args.split),
+                summarize_horizon(
+                    arrays, checkpoint_step_value=target.step, split=args.split
+                ),
             )
             _write_csv(
                 checkpoint_dir / "joint_metrics.csv",
-                summarize_joints(arrays, checkpoint_step_value=target.step, split=args.split),
+                summarize_joints(
+                    arrays, checkpoint_step_value=target.step, split=args.split
+                ),
             )
             all_condition_summaries.append(condition_summary)
             all_paired_summaries.append(paired_summary)
@@ -1456,9 +1675,12 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir / "condition_summary_all_checkpoints.csv",
             combined_conditions,
         )
-        _write_csv(args.output_dir / "paired_summary_all_checkpoints.csv", combined_paired)
+        _write_csv(
+            args.output_dir / "paired_summary_all_checkpoints.csv", combined_paired
+        )
         primary = combined_paired[
-            (combined_paired["scope"] == "all_tasks") & (combined_paired["group"] == "all")
+            (combined_paired["scope"] == "all_tasks")
+            & (combined_paired["group"] == "all")
         ]
         _write_csv(args.output_dir / "primary_task_balanced_result.csv", primary)
         metadata = _run_metadata(
@@ -1479,7 +1701,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except BaseException:
-        LOGGER.exception("Geometry correspondence evaluation failed; INCOMPLETE retained")
+        LOGGER.exception(
+            "Geometry correspondence evaluation failed; INCOMPLETE retained"
+        )
         raise
 
 

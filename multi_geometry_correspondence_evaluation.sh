@@ -25,10 +25,34 @@ SHUFFLE_REPEATS="${SHUFFLE_REPEATS:-1}"
 BOOTSTRAP_REPLICATES="${BOOTSTRAP_REPLICATES:-10000}"
 MAX_EPISODES="${MAX_EPISODES:-0}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-5}"
-INTERVENTIONS=("phase_matched" "out_of_phase" "zero_geometry")
+INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"
+IFS=',' read -r -a INTERVENTIONS <<< "$INTERVENTIONS_CSV"
+[[ ${#INTERVENTIONS[@]} -gt 0 ]] || {
+    echo "ERROR: INTERVENTIONS_CSV must select at least one intervention" >&2
+    exit 1
+}
+declare -A SEEN_INTERVENTIONS=()
+REQUIRES_CROSS_EPISODE_DONORS=0
+for intervention in "${INTERVENTIONS[@]}"; do
+    case "$intervention" in
+        phase_matched | out_of_phase)
+            REQUIRES_CROSS_EPISODE_DONORS=1
+            ;;
+        offset_10pct | offset_50pct | zero_geometry) ;;
+        *)
+            echo "ERROR: unsupported INTERVENTIONS_CSV entry: $intervention" >&2
+            exit 1
+            ;;
+    esac
+    [[ -z "${SEEN_INTERVENTIONS[$intervention]:-}" ]] || {
+        echo "ERROR: duplicate INTERVENTIONS_CSV entry: $intervention" >&2
+        exit 1
+    }
+    SEEN_INTERVENTIONS[$intervention]=1
+done
 
-RGBD_MODEL="$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
-NORMALS_MODEL="$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}"
+RGBD_MODEL="${RGBD_MODEL:-$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
+NORMALS_MODEL="${NORMALS_MODEL:-$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 
 case "$MODE" in
     depth)
@@ -87,7 +111,8 @@ echo "MODE=$MODE"
 echo "DATASET_PATH=$DATASET_PATH (held-out $DATASET_SCOPE only)"
 echo "CHECKPOINT_STEPS=$CHECKPOINT_STEPS"
 echo "INTERVENTIONS=${INTERVENTIONS[*]} (in memory only)"
-echo "DONORS=within this held-out split, exact same task, cross-episode"
+echo "CROSS_EPISODE_DONORS_REQUIRED=$REQUIRES_CROSS_EPISODE_DONORS"
+echo "TEMPORAL_OFFSETS=same episode, discrete circular frame shift"
 echo "RAW_DATA_MUTATION=none"
 
 [[ -x "$GROOT_PYTHON" ]] || { echo "ERROR: missing Python: $GROOT_PYTHON" >&2; exit 1; }
@@ -172,8 +197,8 @@ for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
     summary="$model_dir/evaluation_exec_hor_8/checkpoint_metric_summary.csv"
-    if [[ ! -d "$model_dir" || ! -f "$model_dir/checkpoint-30000/config.json" ]]; then
-        echo "WAITING: ${LABELS[$i]} final checkpoint is not ready: $model_dir" >&2
+    if [[ ! -d "$model_dir" ]]; then
+        echo "WAITING: ${LABELS[$i]} model directory is not ready: $model_dir" >&2
         READY=0
         SELECTED_STEPS+=("")
         continue
@@ -200,13 +225,14 @@ for i in "${!MODEL_DIRS[@]}"; do
     echo "READY: ${LABELS[$i]} geometry=$geometry_key checkpoint(s)=$step"
 done
 
-"$GROOT_PYTHON" - "$DATASET_PATH" "${GEOMETRY_KEYS[@]}" <<'PY'
+"$GROOT_PYTHON" - "$DATASET_PATH" "$REQUIRES_CROSS_EPISODE_DONORS" "${GEOMETRY_KEYS[@]}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 dataset = Path(sys.argv[1])
-geometry_keys = sys.argv[2:]
+requires_cross_episode_donors = bool(int(sys.argv[2]))
+geometry_keys = sys.argv[3:]
 info = json.loads((dataset / "meta" / "info.json").read_text(encoding="utf-8"))
 features = info.get("features", {})
 required = ["observation.images.ego_view", *(f"observation.images.{key}" for key in geometry_keys)]
@@ -219,14 +245,23 @@ for episode in episodes:
     tasks = tuple(episode.get("tasks", []))
     counts[tasks] = counts.get(tasks, 0) + 1
 singletons = {" / ".join(task): count for task, count in counts.items() if count < 2}
-if singletons:
+if requires_cross_episode_donors and singletons:
     raise SystemExit(f"Same-task donor derangement is impossible for: {singletons}")
-print(f"Held-out donor pool: {len(episodes)} episodes across {len(counts)} tasks; no singleton tasks")
+if requires_cross_episode_donors:
+    print(
+        f"Held-out donor pool: {len(episodes)} episodes across {len(counts)} tasks; "
+        "no singleton tasks"
+    )
+else:
+    print(
+        f"Held-out evaluation pool: {len(episodes)} episodes across {len(counts)} tasks; "
+        "cross-episode donors not requested"
+    )
 PY
 
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
     if [[ "$READY" == "1" ]]; then
-        echo "PRECHECK_ONLY complete: all requested models are ready for three interventions each; nothing was launched."
+        echo "PRECHECK_ONLY complete: all requested models are ready for ${#INTERVENTIONS[@]} intervention(s) each; nothing was launched."
     else
         echo "PRECHECK_ONLY complete: at least one requested model is still pending; nothing was launched."
     fi

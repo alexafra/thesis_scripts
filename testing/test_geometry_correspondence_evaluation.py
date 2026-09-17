@@ -34,7 +34,9 @@ def test_donor_assignment_is_deterministic_same_task_and_never_self():
         _record(4, "task b"),
     ]
     first = geometry.build_donor_assignments(records, shuffle_seed=42, shuffle_repeat=0)
-    second = geometry.build_donor_assignments(records, shuffle_seed=42, shuffle_repeat=0)
+    second = geometry.build_donor_assignments(
+        records, shuffle_seed=42, shuffle_repeat=0
+    )
 
     assert first == second
     by_position = {record.loader_position: record for record in records}
@@ -68,7 +70,43 @@ def test_out_of_phase_mapping_is_shifted_by_half_an_episode():
     assert geometry.donor_frame_for_phase(0, 101, 51, donor_phase="out_of_phase") == 25
     assert geometry.donor_frame_for_phase(25, 101, 51, donor_phase="out_of_phase") == 38
     assert geometry.donor_frame_for_phase(50, 101, 51, donor_phase="out_of_phase") == 0
-    assert geometry.donor_frame_for_phase(100, 101, 51, donor_phase="out_of_phase") == 25
+    assert (
+        geometry.donor_frame_for_phase(100, 101, 51, donor_phase="out_of_phase") == 25
+    )
+
+
+def test_same_episode_offsets_shift_by_requested_fraction_and_wrap():
+    assert (
+        geometry.same_episode_frame_for_offset(0, 101, intervention="offset_10pct")
+        == 10
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(25, 101, intervention="offset_10pct")
+        == 35
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(90, 101, intervention="offset_10pct")
+        == 100
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(100, 101, intervention="offset_10pct")
+        == 9
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(0, 101, intervention="offset_50pct")
+        == 50
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(50, 101, intervention="offset_50pct")
+        == 100
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(100, 101, intervention="offset_50pct")
+        == 49
+    )
+    assert (
+        geometry.same_episode_frame_for_offset(0, 1, intervention="offset_50pct") == 0
+    )
 
 
 def test_training_split_cannot_be_mislabeled_as_evaluation():
@@ -109,7 +147,8 @@ def test_geometry_replacement_changes_only_requested_evaluation_view():
     assert shuffled["video.ego_view"] is flat["video.ego_view"]
     assert shuffled["state.left_arm"] is flat["state.left_arm"]
     assert (
-        shuffled["annotation.human.task_description"] == flat["annotation.human.task_description"]
+        shuffled["annotation.human.task_description"]
+        == flat["annotation.human.task_description"]
     )
     np.testing.assert_array_equal(shuffled["video.depth_gray_view"], donor[None])
     np.testing.assert_array_equal(flat["video.depth_gray_view"], depth)
@@ -175,7 +214,9 @@ def test_paired_summary_reports_sensitivity_and_positive_counterfactual_error_de
         bootstrap_replicates=20,
         bootstrap_seed=42,
     )
-    primary = summary[(summary["scope"] == "all_tasks") & (summary["group"] == "all")].iloc[0]
+    primary = summary[
+        (summary["scope"] == "all_tasks") & (summary["group"] == "all")
+    ].iloc[0]
 
     assert np.isclose(primary["micro_delta_mae_counterfactual_minus_intact"], 0.4)
     assert np.isclose(primary["episode_macro_mean_delta_mae"], 0.4)
@@ -184,14 +225,16 @@ def test_paired_summary_reports_sensitivity_and_positive_counterfactual_error_de
     assert primary["episode_macro_prediction_change_mae"] == 0.5
 
 
-def test_runner_is_evaluation_only_and_runs_three_interventions_for_both_models():
+def test_runner_is_evaluation_only_and_supports_selected_interventions_for_both_models():
     runner = SCRIPT_PATH.with_name("multi_geometry_correspondence_evaluation.sh")
     text = runner.read_text(encoding="utf-8")
 
     for required in (
         'MODE="${MODE:-both}"',
         'GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")',
-        'INTERVENTIONS=("phase_matched" "out_of_phase" "zero_geometry")',
+        'INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"',
+        "offset_10pct | offset_50pct | zero_geometry",
+        'NORMALS_MODEL="${NORMALS_MODEL:-',
         'DATASET_SCOPE="validation"',
         'DATASET_PATH="$DATASET_ROOT/validation"',
         "--geometry-key",
@@ -228,3 +271,27 @@ def test_zero_geometry_frame_mapping_has_no_donor():
     assert {row["replacement_source"] for row in rows} == {"all_zeros"}
     assert all(row["donor_episode_index"] is None for row in rows)
     assert all(row["donor_frame"] is None for row in rows)
+
+
+def test_same_episode_offset_mapping_uses_recipient_episode_without_donor_assignment():
+    record = _record(0, "task a", length=101)
+    rows = geometry._frame_mapping(
+        [record],
+        {0: {}},
+        execution_horizon=25,
+        intervention="offset_10pct",
+    )
+
+    assert [row["recipient_frame"] for row in rows] == [0, 25, 50, 75, 100]
+    assert [row["donor_frame"] for row in rows] == [10, 35, 60, 85, 9]
+    assert {row["replacement_source"] for row in rows} == {"same_episode"}
+    assert {row["donor_episode_index"] for row in rows} == {record.episode_index}
+    manifest = geometry._donor_manifest({0: {}}, intervention="offset_10pct")
+    assert manifest == [
+        {
+            "intervention": "offset_10pct",
+            "donor_required": False,
+            "replacement": "same-episode geometry with a circular integer-frame shift",
+            "phase_offset_fraction": 0.1,
+        }
+    ]
