@@ -13,6 +13,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 SUPPORT = SCRIPTS_DIR / "inspire_incremental_append_support.py"
 PIPELINE = SCRIPTS_DIR / "append_inspire_stack_0915.sh"
 V2_BASE_NAME = "all_tasks_655eps_20260916_normals_range_mask_v2"
+V2_713_BASE_NAME = "all_tasks_713eps_20260917_normals_range_mask_v2"
+V2_856_TARGET_NAME = "all_tasks_856eps_20260918_normals_range_mask_v2"
 
 
 def run_support(*arguments: object, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -877,6 +879,161 @@ def test_check_defaults_to_migrated_v2_base_and_pins_converter_v2(
         "--camera-calibration-profile d435i-254322071415 "
         f"{paths['words_source']} toothpaste_09_16 6",
     ]
+
+
+def test_cereal_pyramid_preset_pins_713_to_856_counts_goals_and_converter(
+    tmp_path: Path,
+) -> None:
+    environment, paths = fake_pipeline_environment(tmp_path)
+    default_base = paths["base"].parent / V2_713_BASE_NAME
+    paths["base"].rename(default_base)
+    environment.pop("BASE_DATASET")
+    environment.pop("TARGET_DATASET")
+    environment["SOURCE_A"] = str(paths["source"])
+    environment["SOURCE_B"] = str(paths["words_source"])
+
+    result = subprocess.run(
+        ["bash", str(PIPELINE), "check", "cereal-pyramid-0917"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = paths["log"].read_text(encoding="utf-8").splitlines()
+    assert any(
+        line.startswith("support validate-base")
+        and f"--root {default_base}" in line
+        and "--episodes 571 71 71" in line
+        and "--frames 231836 28259 28762" in line
+        for line in calls
+    )
+    source_calls = [
+        line for line in calls if line.startswith("support validate-source")
+    ]
+    assert len(source_calls) == 2
+    assert (
+        f"--root {paths['source']} --episodes 88 --frames 28360 "
+        "--goal pick up the cereal box. --goal put down the cereal box."
+    ) in source_calls[0]
+    assert (
+        f"--root {paths['words_source']} --episodes 55 --frames 50466 "
+        "--goal build a cup pyramid left-to-right."
+    ) in source_calls[1]
+    convert_calls = [line for line in calls if line.startswith("convert ")]
+    assert convert_calls == [
+        "convert --preflight-only --include-surface-normals "
+        "--surface-normals-encoding-version 2 --end-effector inspire-ftp "
+        "--camera-calibration-profile d435i-254322071415 "
+        f"{paths['source']} cereal_box_09_16 6",
+        "convert --preflight-only --include-surface-normals "
+        "--surface-normals-encoding-version 2 --end-effector inspire-ftp "
+        "--camera-calibration-profile d435i-254322071415 "
+        f"{paths['words_source']} cup_pyramid_09_16_02 6",
+    ]
+    assert not (paths["base"].parent / V2_856_TARGET_NAME).exists()
+
+
+def test_prepare_seals_new_component_without_append_then_build_resumes(
+    tmp_path: Path,
+) -> None:
+    environment, paths = fake_pipeline_environment(tmp_path)
+    environment["SOURCE_A"] = str(paths["source"])
+    environment["SOURCE_B"] = str(paths["words_source"])
+    new_component = "cereal_box_and_cup_pyramid_09_16_02"
+    environment["EXPECTED_COMPONENT"] = str(paths["checkpoint"] / new_component)
+
+    prepared = subprocess.run(
+        ["bash", str(PIPELINE), "prepare", "cereal-pyramid-0917"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert prepared.returncode == 0, prepared.stderr
+    assert "PREPARE_COMPLETE" in prepared.stdout
+    assert not paths["target"].exists()
+    assert (paths["checkpoint"] / new_component).is_dir()
+    state = json.loads(
+        (paths["checkpoint"] / "component_checkpoint.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["phase"] == "component_ready"
+    prepared_calls = paths["log"].read_text(encoding="utf-8").splitlines()
+    assert len([line for line in prepared_calls if line.startswith("convert ")]) == 3
+    assert not any(line.startswith("append ") for line in prepared_calls)
+    assert not any(line.startswith("copy ") for line in prepared_calls)
+    assert not any(line.startswith("uv ") for line in prepared_calls)
+    assert not any("support publish-no-replace" in line for line in prepared_calls)
+
+    built = subprocess.run(
+        ["bash", str(PIPELINE), "build", "cereal-pyramid-0917"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert built.returncode == 0, built.stderr
+    assert paths["target"].is_dir()
+    assert (
+        "Final population: train=684/293350, validation=86/38147, "
+        "test=86/36186"
+    ) in built.stdout
+    all_calls = paths["log"].read_text(encoding="utf-8").splitlines()
+    assert len([line for line in all_calls if line.startswith("convert ")]) == 3
+    assert len([line for line in all_calls if line.startswith("append ")]) == 1
+    assert any(
+        "support validate-final" in line
+        and "--episodes 113 15 15" in line
+        and "--frames 61514 9888 7424" in line
+        for line in all_calls
+    )
+
+
+def test_prepare_allows_training_but_blocks_another_conversion(tmp_path: Path) -> None:
+    environment, paths = fake_pipeline_environment(tmp_path)
+    environment["SOURCE_A"] = str(paths["source"])
+    environment["SOURCE_B"] = str(paths["words_source"])
+    checker = tmp_path / "selective-pgrep.sh"
+    write_executable(
+        checker,
+        "#!/usr/bin/env bash\n"
+        "pattern=${!#}\n"
+        "case \"${ACTIVE_KIND:-}\" in\n"
+        "  training) [[ \"$pattern\" == *'[l]aunch_finetune'* ]] && "
+        "printf '123 launch_finetune.py\\n' ;;\n"
+        "  conversion) [[ \"$pattern\" == *'[c]onvert_to_lerobot2'* ]] && "
+        "printf '456 convert_to_lerobot2.sh\\n' ;;\n"
+        "esac\n",
+    )
+    environment["PROCESS_CHECKER"] = str(checker)
+    environment["ACTIVE_KIND"] = "training"
+
+    prepared = subprocess.run(
+        ["bash", str(PIPELINE), "prepare", "cereal-pyramid-0917"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+
+    environment["ACTIVE_KIND"] = "conversion"
+    blocked = subprocess.run(
+        ["bash", str(PIPELINE), "prepare", "cereal-pyramid-0917"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert blocked.returncode != 0
+    assert "Stop recording, data editing, and other conversion" in (
+        blocked.stdout + blocked.stderr
+    )
 
 
 def test_build_failure_retains_hidden_work_and_preserves_inputs(

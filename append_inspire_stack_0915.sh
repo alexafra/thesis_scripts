@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Incrementally append both 2026-09-16 Inspire collections (toothpaste
-# pick/place and left-to-right cup pyramids) to the converted 655-episode corpus.
+# Incrementally append one known pair of Inspire collections to its converted
+# base corpus. Presets below pin every source, count, goal, and output identity.
 # The base and original sources are never converted or mutated in place.
 # Exactly one sealed checkpoint advances from combined-component-ready to
 # final-build-ready. Unsealed work is retained on every failure.
@@ -11,15 +11,22 @@ export PATH="/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 usage() {
     cat <<'EOF'
-Usage: append_inspire_stack_0915.sh MODE
+Usage: append_inspire_stack_0915.sh MODE [PRESET]
 
 Modes:
   check           Read-only source/base/converter preflight.
-  build           Goal-stratify and convert both incoming collections, append
-                  them to the 655-episode base, validate, detach, and publish.
+  prepare         Preflight, split, convert, and seal only the incoming
+                  component. This may run while model training reads the base.
+  build           Resume a prepared component (or prepare it if absent), append
+                  it to the preset base, regenerate train stats, and publish.
+
+Presets:
+  toothpaste-pyramid-0916   655 -> 713 (default; existing behavior)
+  cereal-pyramid-0917       713 -> 856 (cereal box + cup_pyramid_09_16_02)
 
 There is deliberately no implicit mode and no training mode. In particular,
-check never starts conversion and build always stops after dataset publication.
+check never starts conversion, prepare never appends, and build always stops
+after dataset publication.
 EOF
 }
 
@@ -28,29 +35,84 @@ die() {
     exit 1
 }
 
-[[ $# -eq 1 ]] || { usage >&2; exit 2; }
+(( $# >= 1 && $# <= 2 )) || { usage >&2; exit 2; }
 MODE="$1"
 case "$MODE" in
-    check|build) ;;
+    check|prepare|build) ;;
     -h|--help|help) usage; exit 0 ;;
     *) usage >&2; die "Unknown mode: $MODE" ;;
 esac
+PRESET="${2:-${INSPIRE_APPEND_PRESET:-toothpaste-pyramid-0916}}"
 
 SCRIPTS_DIR="${SCRIPTS_DIR:-/home/alex/Development/scripts}"
 GROOT_DIR="${GROOT_DIR:-/home/alex/Development/Isaac-GR00T}"
 GROOT_PYTHON="${GROOT_PYTHON:-$GROOT_DIR/.venv/bin/python}"
 UNITREE_PYTHON="${UNITREE_PYTHON:-/home/alex/miniconda3/envs/unitree_lerobot/bin/python}"
 DATASET_PARENT="${DATASET_PARENT:-/home/alex/Development/Datasets/lerobot2/inspire}"
-BASE_DATASET="${BASE_DATASET:-$DATASET_PARENT/all_tasks_655eps_20260916_normals_range_mask_v2}"
-PYRAMID_SOURCE="${PYRAMID_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/cup_pyramid_09_16}"
-TOOTHPASTE_SOURCE="${TOOTHPASTE_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/toothpaste_09_16}"
-TARGET_DATASET="${TARGET_DATASET:-$DATASET_PARENT/all_tasks_713eps_20260917_normals_range_mask_v2}"
+
+case "$PRESET" in
+    toothpaste-pyramid-0916)
+        BASE_DATASET="${BASE_DATASET:-$DATASET_PARENT/all_tasks_655eps_20260916_normals_range_mask_v2}"
+        SOURCE_A="${SOURCE_A:-${PYRAMID_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/cup_pyramid_09_16}}"
+        SOURCE_B="${SOURCE_B:-${TOOTHPASTE_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/toothpaste_09_16}}"
+        TARGET_DATASET="${TARGET_DATASET:-$DATASET_PARENT/all_tasks_713eps_20260917_normals_range_mask_v2}"
+        SOURCE_A_NAME="cup_pyramid_09_16"
+        SOURCE_B_NAME="toothpaste_09_16"
+        SOURCE_A_EPISODES=28
+        SOURCE_A_FRAMES=36628
+        SOURCE_A_GOALS=('build a cup pyramid left-to-right.')
+        SOURCE_B_EPISODES=30
+        SOURCE_B_FRAMES=8491
+        SOURCE_B_GOALS=('pick up the cylinder toothpaste.' 'put down the cylinder toothpaste.')
+        SOURCE_A_SNAPSHOT_NAME="pyramid_source_tree_snapshot.json"
+        SOURCE_B_SNAPSHOT_NAME="toothpaste_source_tree_snapshot.json"
+        COMPONENT_NAME="cup_pyramid_and_toothpaste_09_16"
+        APPEND_GENERATION_ID="20260917_cup_pyramid_and_toothpaste_09_16"
+        DEFAULT_RUN_ID="20260917"
+        DEFAULT_PIPELINE_LOG_STEM="inspire_toothpaste_pyramid_0916_append"
+        BASE_EPISODES=(525 65 65)
+        BASE_FRAMES=(196453 22719 24566)
+        COMPONENT_EPISODES=(46 6 6)
+        COMPONENT_FRAMES=(35383 5540 4196)
+        FINAL_EPISODES=(571 71 71)
+        FINAL_FRAMES=(231836 28259 28762)
+        ;;
+    cereal-pyramid-0917)
+        BASE_DATASET="${BASE_DATASET:-$DATASET_PARENT/all_tasks_713eps_20260917_normals_range_mask_v2}"
+        SOURCE_A="${SOURCE_A:-${CEREAL_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/cereal_box_09_16}}"
+        SOURCE_B="${SOURCE_B:-${PYRAMID_02_SOURCE:-/home/alex/Development/Datasets/processed_raw/inspire/cup_pyramid_09_16_02}}"
+        TARGET_DATASET="${TARGET_DATASET:-$DATASET_PARENT/all_tasks_856eps_20260918_normals_range_mask_v2}"
+        SOURCE_A_NAME="cereal_box_09_16"
+        SOURCE_B_NAME="cup_pyramid_09_16_02"
+        SOURCE_A_EPISODES=88
+        SOURCE_A_FRAMES=28360
+        SOURCE_A_GOALS=('pick up the cereal box.' 'put down the cereal box.')
+        SOURCE_B_EPISODES=55
+        SOURCE_B_FRAMES=50466
+        SOURCE_B_GOALS=('build a cup pyramid left-to-right.')
+        SOURCE_A_SNAPSHOT_NAME="cereal_box_09_16_source_tree_snapshot.json"
+        SOURCE_B_SNAPSHOT_NAME="cup_pyramid_09_16_02_source_tree_snapshot.json"
+        COMPONENT_NAME="cereal_box_and_cup_pyramid_09_16_02"
+        APPEND_GENERATION_ID="20260918_cereal_box_and_cup_pyramid_09_16_02"
+        DEFAULT_RUN_ID="20260918"
+        DEFAULT_PIPELINE_LOG_STEM="inspire_cereal_pyramid_0917_append"
+        BASE_EPISODES=(571 71 71)
+        BASE_FRAMES=(231836 28259 28762)
+        COMPONENT_EPISODES=(113 15 15)
+        COMPONENT_FRAMES=(61514 9888 7424)
+        FINAL_EPISODES=(684 86 86)
+        FINAL_FRAMES=(293350 38147 36186)
+        ;;
+    *)
+        usage >&2
+        die "Unknown preset: $PRESET"
+        ;;
+esac
+
 TARGET_NAME="$(basename "$TARGET_DATASET")"
-RUN_ID="${RUN_ID:-20260917}"
+RUN_ID="${RUN_ID:-$DEFAULT_RUN_ID}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "RUN_ID is not a safe name: $RUN_ID"
 
-COMPONENT_NAME="cup_pyramid_and_toothpaste_09_16"
-APPEND_GENERATION_ID="20260917_cup_pyramid_and_toothpaste_09_16"
 APPEND_PROVENANCE_RELATIVE="provenance/incremental_append_generations/$APPEND_GENERATION_ID"
 export INSPIRE_APPEND_CHECKPOINT_COMPONENT="$COMPONENT_NAME"
 export INSPIRE_APPEND_PROVENANCE_RELATIVE="$APPEND_PROVENANCE_RELATIVE"
@@ -67,7 +129,7 @@ CHECKPOINT_PROVENANCE="$CHECKPOINT_ROOT/provenance"
 CHECKPOINT_SOURCE_BUNDLE="$CHECKPOINT_PROVENANCE/source_bundle"
 CHECKPOINT_APPEND_PROVENANCE="$CHECKPOINT_BUILD/$APPEND_PROVENANCE_RELATIVE"
 LOG_ROOT="${LOG_ROOT:-/home/alex/Development/logs}"
-PIPELINE_LOG="${PIPELINE_LOG:-$LOG_ROOT/data_pipeline/inspire_toothpaste_pyramid_0916_append_${RUN_ID}.log}"
+PIPELINE_LOG="${PIPELINE_LOG:-$LOG_ROOT/data_pipeline/${DEFAULT_PIPELINE_LOG_STEM}_${RUN_ID}.log}"
 LOCK_FILE="${LOCK_FILE:-$LOG_ROOT/data_pipeline/.inspire_incremental_append.lock}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-360}"
 BULK_COPY_HEADROOM_GIB="${BULK_COPY_HEADROOM_GIB:-${DETACH_HEADROOM_GIB:-32}}"
@@ -81,13 +143,6 @@ SUPPORT_SCRIPT="${SUPPORT_SCRIPT:-$SCRIPTS_DIR/inspire_incremental_append_suppor
 PROCESS_CHECKER="${PROCESS_CHECKER:-pgrep}"
 UV="${UV:-uv}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-$GROOT_DIR/examples/UnitreeG1/g1_inspire_headonly_config.py}"
-
-BASE_EPISODES=(525 65 65)
-BASE_FRAMES=(196453 22719 24566)
-COMPONENT_EPISODES=(46 6 6)
-COMPONENT_FRAMES=(35383 5540 4196)
-FINAL_EPISODES=(571 71 71)
-FINAL_FRAMES=(231836 28259 28762)
 
 safe_remove_checkpoint() {
     local path="$1"
@@ -145,24 +200,32 @@ require_tools() {
     command -v "$COPY_TOOL" >/dev/null 2>&1 || die "cp-compatible COPY_TOOL is required"
 }
 
-require_quiescent_writers() {
+require_quiescent_processes() {
+    local scope="$1"
     command -v "$PROCESS_CHECKER" >/dev/null 2>&1 || \
         die "Process checker is missing: $PROCESS_CHECKER"
+    local pattern='[t]eleop_hand_and_arm\.py|[d]ata_editor_EN_rgbd\.py|[c]onvert_to_lerobot2\.sh|[c]onvert_unitree_json_to_lerobot'
+    if [[ "$scope" == build ]]; then
+        pattern+='|[l]aunch_finetune|[e]valuate_checkpoints'
+    fi
     local active
-    active="$("$PROCESS_CHECKER" -af '[t]eleop_hand_and_arm\.py|[d]ata_editor_EN_rgbd\.py|[c]onvert_unitree_json_to_lerobot|[l]aunch_finetune|[e]valuate_checkpoints' || true)"
+    active="$("$PROCESS_CHECKER" -af "$pattern" || true)"
     if [[ -n "$active" ]]; then
-        printf 'Conflicting writer process(es):\n%s\n' "$active" >&2
+        printf 'Conflicting process(es):\n%s\n' "$active" >&2
+        if [[ "$scope" == prepare ]]; then
+            die "Stop recording, data editing, and other conversion before component preparation"
+        fi
         die "Stop recording, data editing, conversion, training, and evaluation before this append"
     fi
 }
 
 validate_paths() {
-    "$GROOT_PYTHON" - "$BASE_DATASET" "$PYRAMID_SOURCE" "$TOOTHPASTE_SOURCE" "$TARGET_DATASET" "$WORK_ROOT" "$BUILD_DATASET" "$CHECKPOINT_ROOT" <<'PY'
+    "$GROOT_PYTHON" - "$BASE_DATASET" "$SOURCE_A" "$SOURCE_B" "$TARGET_DATASET" "$WORK_ROOT" "$BUILD_DATASET" "$CHECKPOINT_ROOT" <<'PY'
 from pathlib import Path
 import sys
 
 paths = {name: Path(value).expanduser().resolve() for name, value in zip(
-    ("base", "pyramid_source", "toothpaste_source", "target", "work", "build", "checkpoint"),
+    ("base", "source_a", "source_b", "target", "work", "build", "checkpoint"),
     sys.argv[1:],
     strict=True,
 )}
@@ -177,18 +240,32 @@ for left_name, left in paths.items():
 PY
 }
 
+validate_one_source() {
+    local root="$1"
+    local episodes="$2"
+    local frames="$3"
+    shift 3
+    local -a goal_arguments=()
+    local goal
+    for goal in "$@"; do
+        goal_arguments+=(--goal "$goal")
+    done
+    "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-source \
+        --root "$root" --episodes "$episodes" --frames "$frames" \
+        "${goal_arguments[@]}"
+}
+
 base_and_source_preflight() {
-    [[ -d "$BASE_DATASET" ]] || die "Converted 655-episode base is missing: $BASE_DATASET"
-    [[ -d "$PYRAMID_SOURCE" ]] || die "Cup-pyramid source is missing: $PYRAMID_SOURCE"
-    [[ -d "$TOOTHPASTE_SOURCE" ]] || die "Toothpaste source is missing: $TOOTHPASTE_SOURCE"
+    [[ -d "$BASE_DATASET" ]] || die "Converted preset base is missing: $BASE_DATASET"
+    [[ -d "$SOURCE_A" ]] || die "Preset source is missing: $SOURCE_A"
+    [[ -d "$SOURCE_B" ]] || die "Preset source is missing: $SOURCE_B"
     validate_paths
-    "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-source \
-        --root "$PYRAMID_SOURCE" --episodes 28 --frames 36628 \
-        --goal 'build a cup pyramid left-to-right.'
-    "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-source \
-        --root "$TOOTHPASTE_SOURCE" --episodes 30 --frames 8491 \
-        --goal 'pick up the cylinder toothpaste.' \
-        --goal 'put down the cylinder toothpaste.'
+    validate_one_source \
+        "$SOURCE_A" "$SOURCE_A_EPISODES" "$SOURCE_A_FRAMES" \
+        "${SOURCE_A_GOALS[@]}"
+    validate_one_source \
+        "$SOURCE_B" "$SOURCE_B_EPISODES" "$SOURCE_B_FRAMES" \
+        "${SOURCE_B_GOALS[@]}"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-base \
         --root "$BASE_DATASET" \
         --episodes "${BASE_EPISODES[@]}" --frames "${BASE_FRAMES[@]}"
@@ -198,14 +275,14 @@ base_and_source_preflight() {
         --surface-normals-encoding-version 2 \
         --end-effector inspire-ftp \
         --camera-calibration-profile d435i-254322071415 \
-        "$PYRAMID_SOURCE" cup_pyramid_09_16 "$JOBS"
+        "$SOURCE_A" "$SOURCE_A_NAME" "$JOBS"
     bash "$CONVERT_SCRIPT" \
         --preflight-only \
         --include-surface-normals \
         --surface-normals-encoding-version 2 \
         --end-effector inspire-ftp \
         --camera-calibration-profile d435i-254322071415 \
-        "$TOOTHPASTE_SOURCE" toothpaste_09_16 "$JOBS"
+        "$SOURCE_B" "$SOURCE_B_NAME" "$JOBS"
 }
 
 require_free_gib() {
@@ -245,7 +322,7 @@ adopt_orphan_final_build() {
         --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
         --root "$CHECKPOINT_COMPONENT" \
-        --component cup_pyramid_09_16 --component toothpaste_09_16
+        --component "$SOURCE_A_NAME" --component "$SOURCE_B_NAME"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-final \
         --base "$BASE_DATASET" --component "$CHECKPOINT_COMPONENT" \
         --output "$CHECKPOINT_BUILD" \
@@ -254,11 +331,11 @@ adopt_orphan_final_build() {
         --dataset-root "$CHECKPOINT_BUILD" --expected-frames "${FINAL_FRAMES[0]}" \
         --report "$CHECKPOINT_APPEND_PROVENANCE/stats_finalization_report.json"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-        --root "$PYRAMID_SOURCE" \
-        --snapshot "$CHECKPOINT_PROVENANCE/pyramid_source_tree_snapshot.json"
+        --root "$SOURCE_A" \
+        --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_A_SNAPSHOT_NAME"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-        --root "$TOOTHPASTE_SOURCE" \
-        --snapshot "$CHECKPOINT_PROVENANCE/toothpaste_source_tree_snapshot.json"
+        --root "$SOURCE_B" \
+        --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_B_SNAPSHOT_NAME"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
         --root "$CHECKPOINT_BUILD" \
         --output "$CHECKPOINT_PROVENANCE/build_tree_snapshot.json"
@@ -292,20 +369,23 @@ recover_published_target() {
         --report "$TARGET_DATASET/$APPEND_PROVENANCE_RELATIVE/stats_finalization_report.json" \
         --read-only
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-        --root "$PYRAMID_SOURCE" \
-        --snapshot "$CHECKPOINT_PROVENANCE/pyramid_source_tree_snapshot.json"
+        --root "$SOURCE_A" \
+        --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_A_SNAPSHOT_NAME"
     "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-        --root "$TOOTHPASTE_SOURCE" \
-        --snapshot "$CHECKPOINT_PROVENANCE/toothpaste_source_tree_snapshot.json"
+        --root "$SOURCE_B" \
+        --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_B_SNAPSHOT_NAME"
     safe_remove_checkpoint "$CHECKPOINT_ROOT"
     printf '[resume] Verified already-published target and removed only its sealed cleanup checkpoint.\n'
     printf 'DATASET_PUBLISHED=%s\n' "$TARGET_DATASET"
 }
 
 build_dataset() {
-    require_quiescent_writers
+    local prepare_only="$1"
     refuse_unsealed_scratch
     if [[ -e "$TARGET_DATASET" || -L "$TARGET_DATASET" ]]; then
+        if [[ "$prepare_only" == 1 ]]; then
+            die "Target is already present; component preparation is not applicable: $TARGET_DATASET"
+        fi
         recover_published_target
         return
     fi
@@ -317,9 +397,18 @@ build_dataset() {
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" normalize-checkpoint \
             --root "$CHECKPOINT_ROOT"
         if [[ "$checkpoint_phase_value" == component_ready && -e "$CHECKPOINT_BUILD" ]]; then
+            if [[ "$prepare_only" == 1 ]]; then
+                die "A later build phase is pending recovery; run build instead of prepare"
+            fi
             adopt_orphan_final_build
             checkpoint_phase_value=final_build_ready
         fi
+    fi
+
+    if [[ "$prepare_only" == 1 && "$checkpoint_phase_value" != none && "$checkpoint_phase_value" != component_ready ]]; then
+        printf 'PREPARE_COMPLETE: checkpoint is already beyond conversion (%s).\n' \
+            "$checkpoint_phase_value"
+        return
     fi
 
     if [[ "$checkpoint_phase_value" == publish_ready ]]; then
@@ -337,22 +426,23 @@ build_dataset() {
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
             --root "$BASE_DATASET" --output "$PROVENANCE_STAGE/base_tree_snapshot.json"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
-            --root "$PYRAMID_SOURCE" --output "$PROVENANCE_STAGE/pyramid_source_tree_snapshot.json"
+            --root "$SOURCE_A" --output "$PROVENANCE_STAGE/$SOURCE_A_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
-            --root "$TOOTHPASTE_SOURCE" --output "$PROVENANCE_STAGE/toothpaste_source_tree_snapshot.json"
+            --root "$SOURCE_B" --output "$PROVENANCE_STAGE/$SOURCE_B_SNAPSHOT_NAME"
 
         printf '[bundle] Hard-linking an immutable two-source view without duplicating raw payload.\n'
         mkdir -p -- "$SOURCE_BUNDLE"
-        cp -al -- "$PYRAMID_SOURCE" "$SOURCE_BUNDLE/cup_pyramid_09_16"
-        cp -al -- "$TOOTHPASTE_SOURCE" "$SOURCE_BUNDLE/toothpaste_09_16"
+        cp -al -- "$SOURCE_A" "$SOURCE_BUNDLE/$SOURCE_A_NAME"
+        cp -al -- "$SOURCE_B" "$SOURCE_BUNDLE/$SOURCE_B_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-            --root "$PYRAMID_SOURCE" --snapshot "$PROVENANCE_STAGE/pyramid_source_tree_snapshot.json"
+            --root "$SOURCE_A" --snapshot "$PROVENANCE_STAGE/$SOURCE_A_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-            --root "$TOOTHPASTE_SOURCE" --snapshot "$PROVENANCE_STAGE/toothpaste_source_tree_snapshot.json"
+            --root "$SOURCE_B" --snapshot "$PROVENANCE_STAGE/$SOURCE_B_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
             --root "$SOURCE_BUNDLE" --output "$PROVENANCE_STAGE/source_tree_snapshot.json"
 
-        printf '[split] Independently goal-stratifying cup pyramid then toothpaste with seed 42.\n'
+        printf '[split] Independently goal-stratifying %s then %s with seed 42.\n' \
+            "$SOURCE_A_NAME" "$SOURCE_B_NAME"
         "$UNITREE_PYTHON" "$SPLIT_SCRIPT" "$SOURCE_BUNDLE" \
             --strategy goal-stratified --seed 42 --collection-output "$COMPONENT"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-raw-split \
@@ -360,21 +450,22 @@ build_dataset() {
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
             --root "$COMPONENT" \
-            --component cup_pyramid_09_16 --component toothpaste_09_16
+            --component "$SOURCE_A_NAME" --component "$SOURCE_B_NAME"
 
-        printf '[convert] Converting only the combined 58-episode incoming component.\n'
+        printf '[convert] Converting only the combined %d-episode incoming component.\n' \
+            "$((SOURCE_A_EPISODES + SOURCE_B_EPISODES))"
         bash "$CONVERT_SCRIPT" \
             --include-surface-normals \
             --surface-normals-encoding-version 2 \
             --end-effector inspire-ftp \
             --camera-calibration-profile d435i-254322071415 \
-            "$COMPONENT" cup_pyramid_and_toothpaste_09_16 "$JOBS"
+            "$COMPONENT" "$COMPONENT_NAME" "$JOBS"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-component \
             --root "$COMPONENT" --base "$BASE_DATASET" \
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
             --root "$COMPONENT" \
-            --component cup_pyramid_09_16 --component toothpaste_09_16
+            --component "$SOURCE_A_NAME" --component "$SOURCE_B_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" snapshot-tree \
             --root "$COMPONENT" --output "$PROVENANCE_STAGE/component_tree_snapshot.json"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" write-component-checkpoint \
@@ -383,7 +474,25 @@ build_dataset() {
             die "Resume checkpoint appeared during conversion: $CHECKPOINT_ROOT"
         mv -- "$WORK_ROOT" "$CHECKPOINT_ROOT"
         checkpoint_phase_value=component_ready
-        printf '[checkpoint] Sealed the converted 58-episode component for safe reuse.\n'
+        printf '[checkpoint] Sealed the converted %d-episode component for safe reuse.\n' \
+            "$((SOURCE_A_EPISODES + SOURCE_B_EPISODES))"
+    fi
+
+    if [[ "$prepare_only" == 1 ]]; then
+        [[ "$checkpoint_phase_value" == component_ready ]] || \
+            die "Unexpected prepare checkpoint phase: $checkpoint_phase_value"
+        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-component-checkpoint \
+            --root "$CHECKPOINT_ROOT" --base "$BASE_DATASET" \
+            --source "$CHECKPOINT_SOURCE_BUNDLE"
+        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-component \
+            --root "$CHECKPOINT_COMPONENT" --base "$BASE_DATASET" \
+            --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
+        "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
+            --root "$CHECKPOINT_COMPONENT" \
+            --component "$SOURCE_A_NAME" --component "$SOURCE_B_NAME"
+        printf 'PREPARE_COMPLETE: converted component is sealed; base was not appended or published.\n'
+        printf 'COMPONENT_PREPARED=%s\n' "$CHECKPOINT_COMPONENT"
+        return
     fi
 
     if [[ "$checkpoint_phase_value" == component_ready ]]; then
@@ -395,7 +504,7 @@ build_dataset() {
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-collection-order \
             --root "$CHECKPOINT_COMPONENT" \
-            --component cup_pyramid_09_16 --component toothpaste_09_16
+            --component "$SOURCE_A_NAME" --component "$SOURCE_B_NAME"
         printf '[reuse] Hard-linking the immutable base into a hidden build only.\n'
         [[ "$(stat -c %d "$BASE_DATASET")" == "$(stat -c %d "$DATASET_PARENT")" ]] || \
             die "Base and build parent must be on the same filesystem"
@@ -408,8 +517,8 @@ build_dataset() {
             --base "$BASE_DATASET" --component "$CHECKPOINT_COMPONENT" --output "$BUILD_DATASET" \
             --source-snapshot "$CHECKPOINT_PROVENANCE/source_tree_snapshot.json" \
             --base-snapshot "$CHECKPOINT_PROVENANCE/base_tree_snapshot.json" \
-            --source-component "cup_pyramid_09_16=$CHECKPOINT_PROVENANCE/pyramid_source_tree_snapshot.json" \
-            --source-component "toothpaste_09_16=$CHECKPOINT_PROVENANCE/toothpaste_source_tree_snapshot.json"
+            --source-component "$SOURCE_A_NAME=$CHECKPOINT_PROVENANCE/$SOURCE_A_SNAPSHOT_NAME" \
+            --source-component "$SOURCE_B_NAME=$CHECKPOINT_PROVENANCE/$SOURCE_B_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" validate-final \
             --base "$BASE_DATASET" --component "$CHECKPOINT_COMPONENT" --output "$BUILD_DATASET" \
             --episodes "${COMPONENT_EPISODES[@]}" --frames "${COMPONENT_FRAMES[@]}"
@@ -433,11 +542,11 @@ build_dataset() {
             --dataset-root "$BUILD_DATASET" --expected-frames "${FINAL_FRAMES[0]}" \
             --report "$BUILD_DATASET/$APPEND_PROVENANCE_RELATIVE/stats_finalization_report.json"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-            --root "$PYRAMID_SOURCE" \
-            --snapshot "$CHECKPOINT_PROVENANCE/pyramid_source_tree_snapshot.json"
+            --root "$SOURCE_A" \
+            --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_A_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
-            --root "$TOOTHPASTE_SOURCE" \
-            --snapshot "$CHECKPOINT_PROVENANCE/toothpaste_source_tree_snapshot.json"
+            --root "$SOURCE_B" \
+            --snapshot "$CHECKPOINT_PROVENANCE/$SOURCE_B_SNAPSHOT_NAME"
         "$UNITREE_PYTHON" "$SUPPORT_SCRIPT" verify-tree-snapshot \
             --root "$CHECKPOINT_SOURCE_BUNDLE" \
             --snapshot "$CHECKPOINT_PROVENANCE/source_tree_snapshot.json"
@@ -507,19 +616,26 @@ exec 9>"$LOCK_FILE"
 flock -n 9 || die "Another Inspire append pipeline owns $LOCK_FILE"
 LOCK_HELD=1
 
-if [[ "$MODE" == build ]]; then
+if [[ "$MODE" == prepare || "$MODE" == build ]]; then
     exec > >(tee -a "$PIPELINE_LOG") 2>&1
 fi
 
 case "$MODE" in
     check)
-        require_quiescent_writers
+        require_quiescent_processes build
         base_and_source_preflight
         printf 'CHECK_COMPLETE: incremental append is ready; nothing was converted or trained.\n'
         ;;
-    build)
-        require_quiescent_writers
+    prepare)
+        require_quiescent_processes prepare
         base_and_source_preflight
-        build_dataset
+        build_dataset 1
+        ;;
+    build)
+        require_quiescent_processes build
+        if [[ ! -e "$CHECKPOINT_ROOT" && ! -L "$CHECKPOINT_ROOT" && ! -e "$TARGET_DATASET" && ! -L "$TARGET_DATASET" ]]; then
+            base_and_source_preflight
+        fi
+        build_dataset 0
         ;;
 esac
