@@ -130,7 +130,15 @@ def test_zero_image_is_rgb_only_and_zero_geometry_remains_geometry_only(tmp_path
         str(tmp_path / "output"),
     ]
     args = geometry.parse_args(
-        [*common, "--view-key", "ego_view", "--intervention", "zero_image"]
+        [
+            *common,
+            "--view-key",
+            "ego_view",
+            "--rgb-contract",
+            "rgb_only",
+            "--intervention",
+            "zero_image",
+        ]
     )
     assert args.geometry_key == "ego_view"
     assert args.intervention == "zero_image"
@@ -145,6 +153,7 @@ def test_zero_image_is_rgb_only_and_zero_geometry_remains_geometry_only(tmp_path
                     *common,
                     "--view-key",
                     view_key,
+                    *(["--rgb-contract", "rgb_only"] if view_key == "ego_view" else []),
                     "--intervention",
                     intervention,
                 ]
@@ -217,6 +226,99 @@ def test_rgb_replacement_changes_only_ego_view_and_zero_image_is_black():
     assert "zero_image" in geometry.INTERVENTIONS
 
 
+def test_brightness_scaling_is_uint8_half_up_nonmutating_and_preserves_normals():
+    rgb = np.array([0, 1, 2, 3, 254, 255], dtype=np.uint8).reshape(1, 2, 3)
+    original = rgb.copy()
+    dimmed = geometry.scale_rgb_brightness(rgb, 0.5)
+
+    assert dimmed.shape == rgb.shape
+    assert dimmed.dtype == np.uint8
+    assert dimmed.flags.c_contiguous
+    assert not np.shares_memory(dimmed, rgb)
+    np.testing.assert_array_equal(dimmed.reshape(-1), [0, 1, 1, 2, 127, 128])
+    np.testing.assert_array_equal(rgb, original)
+
+    normals = np.full((1, 1, 2, 3), 127, dtype=np.uint8)
+    flat = {"video.ego_view": rgb[None], "video.surface_normals_view": normals}
+    replaced = geometry.replace_geometry(flat, "ego_view", dimmed)
+    assert replaced["video.surface_normals_view"] is normals
+    assert replaced["video.ego_view"] is not flat["video.ego_view"]
+    np.testing.assert_array_equal(flat["video.ego_view"], original[None])
+
+    for invalid_scale in (0.0, 1.0, -0.1, float("inf"), float("nan")):
+        try:
+            geometry.scale_rgb_brightness(rgb, invalid_scale)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid brightness scale accepted: {invalid_scale}")
+    try:
+        geometry.scale_rgb_brightness(rgb.astype(np.float32), 0.5)
+    except ValueError as exc:
+        assert "uint8" in str(exc)
+    else:
+        raise AssertionError("non-uint8 brightness input must fail closed")
+
+
+def test_brightness_cli_requires_explicit_valid_scale_and_rgb_contract(tmp_path):
+    common = [
+        "--run-dir",
+        "/model",
+        "--dataset-path",
+        "/dataset/validation",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--view-key",
+        "ego_view",
+        "--rgb-contract",
+        "rgb_only",
+    ]
+    args = geometry.parse_args(
+        [
+            *common,
+            "--intervention",
+            "brightness_scale",
+            "--brightness-scale",
+            "0.5",
+        ]
+    )
+    assert args.brightness_scale == 0.5
+    assert args.rgb_contract == "rgb_only"
+
+    invalid_argvs = (
+        [*common, "--intervention", "brightness_scale"],
+        [
+            *common,
+            "--intervention",
+            "brightness_scale",
+            "--brightness-scale",
+            "1",
+        ],
+        [*common, "--intervention", "zero_image", "--brightness-scale", "0.5"],
+        [
+            "--run-dir",
+            "/model",
+            "--dataset-path",
+            "/dataset/validation",
+            "--output-dir",
+            str(tmp_path / "other"),
+            "--view-key",
+            "ego_view",
+            "--intervention",
+            "brightness_scale",
+            "--brightness-scale",
+            "0.5",
+        ],
+    )
+    for argv in invalid_argvs:
+        try:
+            geometry.parse_args(argv)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"invalid brightness CLI accepted: {argv}")
+
+
 def test_rgb_and_early_fusion_visual_contracts_remain_distinct():
     shared = {
         "state": geometry.ModalityConfig(delta_indices=[0], modality_keys=["state"]),
@@ -247,11 +349,15 @@ def test_rgb_and_early_fusion_visual_contracts_remain_distinct():
             ),
         }
         for intervention_key in intervention_keys:
+            rgb_contract = (
+                "rgb_normals_early_fusion" if intervention_key == "ego_view" else None
+            )
             assert (
                 geometry._validate_contract(
                     fused,
                     geometry_key=intervention_key,
                     execution_horizon=8,
+                    rgb_contract=rgb_contract,
                 )
                 == 8
             )
@@ -260,18 +366,30 @@ def test_rgb_and_early_fusion_visual_contracts_remain_distinct():
         **shared,
         "video": geometry.ModalityConfig(delta_indices=[0], modality_keys=["ego_view"]),
     }
-    try:
+    assert (
         geometry._validate_contract(
             rgb_only,
             geometry_key="ego_view",
             execution_horizon=8,
+            rgb_contract="rgb_only",
         )
-    except ValueError as exc:
-        assert "surface_normals_view" in str(exc)
-    else:
-        raise AssertionError(
-            "RGB-only model must not satisfy the rgb_in_normals contract"
-        )
+        == 8
+    )
+    for modality, contract in (
+        (rgb_only, "rgb_normals_early_fusion"),
+        (fused, "rgb_only"),
+    ):
+        try:
+            geometry._validate_contract(
+                modality,
+                geometry_key="ego_view",
+                execution_horizon=8,
+                rgb_contract=contract,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"mismatched RGB contract accepted: {contract}")
 
 
 def test_rgb_metadata_declares_only_rgb_changed():
@@ -291,6 +409,9 @@ def test_rgb_metadata_declares_only_rgb_changed():
         "language",
         "expert_action",
     ]
+    assert geometry.unchanged_inputs_for_visual_intervention(
+        "ego_view", ["ego_view"]
+    ) == ["state", "language", "expert_action"]
 
 
 def test_zero_geometry_preserves_shape_dtype_and_supports_depth_and_normals():
@@ -370,17 +491,25 @@ def test_runner_is_evaluation_only_and_supports_selected_interventions_for_all_m
 
     for required in (
         'MODE="${MODE:-both}"',
+        'RGB_MODEL="${RGB_MODEL:-',
         'GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")',
         'GEOMETRY_KEYS=("ego_view")',
         'REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")',
+        'RGB_CONTRACTS=("rgb_only")',
+        'RGB_CONTRACTS=("rgb_normals_early_fusion")',
         'INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"',
+        'BRIGHTNESS_SCALE="${BRIGHTNESS_SCALE:-}"',
         "offset_10pct | offset_50pct | zero_geometry | zero_image",
+        "brightness_scale)",
         'NORMALS_MODEL="${NORMALS_MODEL:-',
+        "rgb)",
         "rgb_in_normals)",
         'DATASET_SCOPE="validation"',
         'DATASET_PATH="$DATASET_ROOT/validation"',
         "--view-key",
         "--intervention",
+        "--rgb-contract",
+        "--brightness-scale",
         "--shuffle-seed 42",
         "HF_HUB_OFFLINE=1",
         "PRECHECK_ONLY",
@@ -445,3 +574,89 @@ def test_same_episode_offset_mapping_uses_recipient_episode_without_donor_assign
             "phase_offset_fraction": 0.1,
         }
     ]
+
+
+def test_brightness_manifest_and_mapping_use_same_frame_without_any_donor():
+    record = _record(0, "task a", length=17)
+    rows = geometry._frame_mapping(
+        [record],
+        {0: {}},
+        execution_horizon=8,
+        intervention="brightness_scale",
+        brightness_scale=0.5,
+    )
+
+    assert [row["recipient_frame"] for row in rows] == [0, 8, 16]
+    assert {row["replacement_source"] for row in rows} == {
+        "same_frame_brightness_scale"
+    }
+    assert all(row["donor_progress"] is None for row in rows)
+    assert all(row["donor_episode_index"] is None for row in rows)
+    assert all(row["donor_length"] is None for row in rows)
+    assert all(row["donor_frame"] is None for row in rows)
+    assert {row["brightness_scale"] for row in rows} == {0.5}
+    assert {row["rounding_rule"] for row in rows} == {geometry.BRIGHTNESS_ROUNDING_RULE}
+    assert "brightness_scale" in geometry.CURRENT_FRAME_INTERVENTIONS
+    assert "brightness_scale" not in geometry.CROSS_EPISODE_INTERVENTIONS
+
+    manifest = geometry._donor_manifest(
+        {0: {}}, intervention="brightness_scale", brightness_scale=0.5
+    )
+    assert manifest == [
+        {
+            "intervention": "brightness_scale",
+            "donor_required": False,
+            "replacement": "same-frame ego_view digital sRGB-byte intensity scaling",
+            "brightness_scale": 0.5,
+            "rounding_rule": geometry.BRIGHTNESS_ROUNDING_RULE,
+        }
+    ]
+
+
+def test_brightness_metadata_is_explicit_about_transform_and_unchanged_normals(
+    tmp_path,
+):
+    args = geometry.parse_args(
+        [
+            "--run-dir",
+            "/model",
+            "--dataset-path",
+            "/dataset/validation",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--view-key",
+            "ego_view",
+            "--rgb-contract",
+            "rgb_normals_early_fusion",
+            "--intervention",
+            "brightness_scale",
+            "--brightness-scale",
+            "0.5",
+        ]
+    )
+    metadata = geometry._run_metadata(
+        args=args,
+        target_metadata=[],
+        modality_signature={
+            "video": {
+                "keys": ["ego_view", "surface_normals_view"],
+                "delta_indices": [0],
+                "vision_channel_layout": None,
+            }
+        },
+        elapsed_seconds=1.0,
+    )
+    intervention = metadata["intervention"]
+    assert metadata["version"] == 5
+    assert intervention["brightness_scale"] == 0.5
+    assert intervention["rounding_rule"] == geometry.BRIGHTNESS_ROUNDING_RULE
+    assert intervention["changed_input"] == "ego_view"
+    assert intervention["unchanged_inputs"] == [
+        "surface_normals_view",
+        "state",
+        "language",
+        "expert_action",
+    ]
+    assert "sRGB-byte" in intervention["colour_space_semantics"]
+    assert "auto-exposure" in intervention["caveat"]
+    assert "dark-condition degradation" in intervention["caveat"]

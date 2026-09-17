@@ -26,6 +26,7 @@ BOOTSTRAP_REPLICATES="${BOOTSTRAP_REPLICATES:-10000}"
 MAX_EPISODES="${MAX_EPISODES:-0}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-5}"
 INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"
+BRIGHTNESS_SCALE="${BRIGHTNESS_SCALE:-}"
 IFS=',' read -r -a INTERVENTIONS <<< "$INTERVENTIONS_CSV"
 [[ ${#INTERVENTIONS[@]} -gt 0 ]] || {
     echo "ERROR: INTERVENTIONS_CSV must select at least one intervention" >&2
@@ -33,12 +34,16 @@ IFS=',' read -r -a INTERVENTIONS <<< "$INTERVENTIONS_CSV"
 }
 declare -A SEEN_INTERVENTIONS=()
 REQUIRES_CROSS_EPISODE_DONORS=0
+BRIGHTNESS_REQUESTED=0
 for intervention in "${INTERVENTIONS[@]}"; do
     case "$intervention" in
         phase_matched | out_of_phase)
             REQUIRES_CROSS_EPISODE_DONORS=1
             ;;
         offset_10pct | offset_50pct | zero_geometry | zero_image) ;;
+        brightness_scale)
+            BRIGHTNESS_REQUESTED=1
+            ;;
         *)
             echo "ERROR: unsupported INTERVENTIONS_CSV entry: $intervention" >&2
             exit 1
@@ -53,13 +58,23 @@ done
 
 RGBD_MODEL="${RGBD_MODEL:-$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 NORMALS_MODEL="${NORMALS_MODEL:-$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
+RGB_MODEL="${RGB_MODEL:-$MODEL_ROOT/c_rgb_patch_tuned_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 
 INTERVENES_ON_RGB=0
 case "$MODE" in
+    rgb)
+        MODEL_DIRS=("$RGB_MODEL")
+        GEOMETRY_KEYS=("ego_view")
+        REQUIRED_VIDEO_KEYS=("ego_view")
+        RGB_CONTRACTS=("rgb_only")
+        LABELS=("rgb")
+        INTERVENES_ON_RGB=1
+        ;;
     rgb_in_normals)
         MODEL_DIRS=("$NORMALS_MODEL")
         GEOMETRY_KEYS=("ego_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
+        RGB_CONTRACTS=("rgb_normals_early_fusion")
         LABELS=("rgb_in_rgb_normals")
         INTERVENES_ON_RGB=1
         ;;
@@ -67,33 +82,40 @@ case "$MODE" in
         MODEL_DIRS=("$RGBD_MODEL")
         GEOMETRY_KEYS=("depth_gray_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view")
+        RGB_CONTRACTS=("")
         LABELS=("rgbd")
         ;;
     normals)
         MODEL_DIRS=("$NORMALS_MODEL")
         GEOMETRY_KEYS=("surface_normals_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
+        RGB_CONTRACTS=("")
         LABELS=("rgb_normals")
         ;;
     both)
         MODEL_DIRS=("$RGBD_MODEL" "$NORMALS_MODEL")
         GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view" "surface_normals_view")
+        RGB_CONTRACTS=("" "")
         LABELS=("rgbd" "rgb_normals")
         ;;
     *)
-        echo "ERROR: MODE must be rgb_in_normals, depth, normals, or both; got $MODE" >&2
+        echo "ERROR: MODE must be rgb, rgb_in_normals, depth, normals, or both; got $MODE" >&2
         exit 1
         ;;
 esac
 
 for intervention in "${INTERVENTIONS[@]}"; do
     if [[ "$INTERVENES_ON_RGB" == "1" && "$intervention" == "zero_geometry" ]]; then
-        echo "ERROR: MODE=rgb_in_normals uses zero_image, not zero_geometry" >&2
+        echo "ERROR: RGB intervention modes use zero_image, not zero_geometry" >&2
         exit 1
     fi
     if [[ "$INTERVENES_ON_RGB" != "1" && "$intervention" == "zero_image" ]]; then
-        echo "ERROR: zero_image is only valid with MODE=rgb_in_normals" >&2
+        echo "ERROR: zero_image is only valid with MODE=rgb or MODE=rgb_in_normals" >&2
+        exit 1
+    fi
+    if [[ "$INTERVENES_ON_RGB" != "1" && "$intervention" == "brightness_scale" ]]; then
+        echo "ERROR: brightness_scale is only valid with MODE=rgb or MODE=rgb_in_normals" >&2
         exit 1
     fi
 done
@@ -135,9 +157,33 @@ echo "CHECKPOINT_STEPS=$CHECKPOINT_STEPS"
 echo "INTERVENTIONS=${INTERVENTIONS[*]} (in memory only)"
 echo "CROSS_EPISODE_DONORS_REQUIRED=$REQUIRES_CROSS_EPISODE_DONORS"
 echo "TEMPORAL_OFFSETS=same episode, discrete circular frame shift"
+if [[ "$BRIGHTNESS_REQUESTED" == "1" ]]; then
+    echo "BRIGHTNESS=scale raw ego_view uint8 sRGB bytes in memory; deterministic round-half-up"
+fi
 echo "RAW_DATA_MUTATION=none"
 
 [[ -x "$GROOT_PYTHON" ]] || { echo "ERROR: missing Python: $GROOT_PYTHON" >&2; exit 1; }
+if [[ "$BRIGHTNESS_REQUESTED" == "1" ]]; then
+    [[ -n "$BRIGHTNESS_SCALE" ]] || {
+        echo "ERROR: brightness_scale intervention requires BRIGHTNESS_SCALE" >&2
+        exit 1
+    }
+    "$GROOT_PYTHON" - "$BRIGHTNESS_SCALE" <<'PY'
+import math
+import sys
+
+try:
+    scale = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit(f"BRIGHTNESS_SCALE must be numeric: {sys.argv[1]!r}") from exc
+if not math.isfinite(scale) or not 0 < scale < 1:
+    raise SystemExit("BRIGHTNESS_SCALE must be finite and strictly between 0 and 1")
+print(f"BRIGHTNESS_SCALE={scale:g}")
+PY
+elif [[ -n "$BRIGHTNESS_SCALE" ]]; then
+    echo "ERROR: BRIGHTNESS_SCALE was set but brightness_scale was not requested" >&2
+    exit 1
+fi
 [[ -f "$EVALUATOR" ]] || { echo "ERROR: missing evaluator: $EVALUATOR" >&2; exit 1; }
 [[ -f "$DATASET_PATH/meta/info.json" ]] || {
     echo "ERROR: held-out dataset is incomplete: $DATASET_PATH" >&2
@@ -180,12 +226,16 @@ PY
 
 validate_checkpoint_artifacts() {
     local checkpoint=$1
-    "$GROOT_PYTHON" - "$checkpoint" <<'PY'
+    local view_key=$2
+    local rgb_contract=$3
+    "$GROOT_PYTHON" - "$checkpoint" "$view_key" "$rgb_contract" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 checkpoint = Path(sys.argv[1])
+view_key = sys.argv[2]
+rgb_contract = sys.argv[3] or None
 required = (
     "config.json",
     "embodiment_id.json",
@@ -209,7 +259,40 @@ bad_shards = [
 ]
 if bad_shards:
     raise SystemExit(f"Checkpoint model index references missing/empty shards: {bad_shards}")
-print(f"Checkpoint artifacts complete: {checkpoint.name} ({len(shards)} shards)")
+processor = json.loads((checkpoint / "processor_config.json").read_text(encoding="utf-8"))
+try:
+    video = processor["processor_kwargs"]["modality_configs"]["new_embodiment"]["video"]
+except KeyError as exc:
+    raise SystemExit(f"Checkpoint lacks the NEW_EMBODIMENT video contract: {exc}") from exc
+if view_key == "ego_view" and rgb_contract == "rgb_only":
+    expected_keys = ["ego_view"]
+    expect_fusion = False
+elif view_key == "ego_view" and rgb_contract == "rgb_normals_early_fusion":
+    expected_keys = ["ego_view", "surface_normals_view"]
+    expect_fusion = True
+elif view_key != "ego_view" and rgb_contract is None:
+    expected_keys = ["ego_view", view_key]
+    expect_fusion = True
+else:
+    raise SystemExit(
+        f"Invalid view/contract request: view_key={view_key!r}, rgb_contract={rgb_contract!r}"
+    )
+if video.get("modality_keys") != expected_keys:
+    raise SystemExit(
+        f"Checkpoint video keys {video.get('modality_keys')} do not match {expected_keys}"
+    )
+if video.get("delta_indices") != [0]:
+    raise SystemExit(f"Checkpoint video delta_indices must be [0], got {video.get('delta_indices')}")
+fusion = video.get("channel_fusion")
+if expect_fusion:
+    if not isinstance(fusion, list) or [source.get("key") for source in fusion] != expected_keys:
+        raise SystemExit(f"Checkpoint channel_fusion does not exactly match {expected_keys}: {fusion}")
+elif fusion is not None:
+    raise SystemExit(f"RGB-only checkpoint unexpectedly uses channel_fusion: {fusion}")
+print(
+    f"Checkpoint artifacts and visual contract complete: {checkpoint.name} "
+    f"({len(shards)} shards, keys={expected_keys})"
+)
 PY
 }
 
@@ -218,6 +301,7 @@ SELECTED_STEPS=()
 for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
+    rgb_contract="${RGB_CONTRACTS[$i]}"
     summary="$model_dir/evaluation_exec_hor_8/checkpoint_metric_summary.csv"
     if [[ ! -d "$model_dir" ]]; then
         echo "WAITING: ${LABELS[$i]} model directory is not ready: $model_dir" >&2
@@ -241,7 +325,7 @@ for i in "${!MODEL_DIRS[@]}"; do
             echo "ERROR: selected checkpoint is missing: $model_dir/checkpoint-$selected" >&2
             exit 1
         }
-        validate_checkpoint_artifacts "$model_dir/checkpoint-$selected"
+        validate_checkpoint_artifacts "$model_dir/checkpoint-$selected" "$geometry_key" "$rgb_contract"
     done
     SELECTED_STEPS+=("$step")
     echo "READY: ${LABELS[$i]} view=$geometry_key checkpoint(s)=$step"
@@ -330,8 +414,13 @@ analysis_number=0
 for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
+    rgb_contract="${RGB_CONTRACTS[$i]}"
     step="${SELECTED_STEPS[$i]}"
     read -r -a checkpoint_args <<< "$step"
+    rgb_contract_args=()
+    if [[ -n "$rgb_contract" ]]; then
+        rgb_contract_args=(--rgb-contract "$rgb_contract")
+    fi
     for intervention in "${INTERVENTIONS[@]}"; do
         analysis_number=$((analysis_number + 1))
         output_dir="$model_dir/geometry_correspondence_${intervention}_${DATASET_SCOPE}_exec_hor_${EXECUTION_HORIZON}_${ANALYSIS_ID}"
@@ -339,11 +428,16 @@ for i in "${!MODEL_DIRS[@]}"; do
         echo "Analysis ${analysis_number}/${TOTAL_ANALYSES}: ${LABELS[$i]} / $intervention"
         echo "Model: $model_dir"
         echo "View key: $geometry_key only"
+        echo "RGB contract: ${rgb_contract:-not-applicable}"
         echo "Intervention: $intervention"
         echo "Held-out split: $DATASET_PATH"
         echo "Checkpoint(s): $step"
         echo "Output: $output_dir"
         echo "============================================================"
+        brightness_args=()
+        if [[ "$intervention" == "brightness_scale" ]]; then
+            brightness_args=(--brightness-scale "$BRIGHTNESS_SCALE")
+        fi
         if CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
             "$GROOT_PYTHON" "$EVALUATOR" \
             --run-dir "$model_dir" \
@@ -351,6 +445,8 @@ for i in "${!MODEL_DIRS[@]}"; do
             --output-dir "$output_dir" \
             --view-key "$geometry_key" \
             --intervention "$intervention" \
+            "${rgb_contract_args[@]}" \
+            "${brightness_args[@]}" \
             --split "$DATASET_SCOPE" \
             --checkpoint-steps "${checkpoint_args[@]}" \
             --embodiment-tag NEW_EMBODIMENT \

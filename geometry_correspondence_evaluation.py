@@ -48,13 +48,20 @@ import torch
 LOGGER = logging.getLogger("geometry_correspondence_evaluation")
 GEOMETRY_KEYS = ("depth_gray_view", "surface_normals_view")
 VISUAL_KEYS = ("ego_view", *GEOMETRY_KEYS)
+RGB_CONTRACTS = ("rgb_only", "rgb_normals_early_fusion")
 CROSS_EPISODE_INTERVENTIONS = ("phase_matched", "out_of_phase")
 SAME_EPISODE_OFFSETS = {"offset_10pct": 0.10, "offset_50pct": 0.50}
 ZERO_INTERVENTIONS = ("zero_geometry", "zero_image")
+BRIGHTNESS_INTERVENTION = "brightness_scale"
+BRIGHTNESS_ROUNDING_RULE = (
+    "floor(uint8_pixel * scale + 0.5), then clip to [0, 255] and cast to uint8"
+)
+CURRENT_FRAME_INTERVENTIONS = (*ZERO_INTERVENTIONS, BRIGHTNESS_INTERVENTION)
 INTERVENTIONS = (
     *CROSS_EPISODE_INTERVENTIONS,
     *SAME_EPISODE_OFFSETS,
     *ZERO_INTERVENTIONS,
+    BRIGHTNESS_INTERVENTION,
 )
 CONDITIONS = ("intact", "counterfactual")
 
@@ -113,6 +120,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--intervention", choices=INTERVENTIONS, default="phase_matched"
     )
+    parser.add_argument(
+        "--brightness-scale",
+        type=float,
+        help="Required only for intervention=brightness_scale (for example 0.5).",
+    )
+    parser.add_argument(
+        "--rgb-contract",
+        choices=RGB_CONTRACTS,
+        help=(
+            "Required when replacing ego_view: rgb_only for a three-channel RGB "
+            "model, or rgb_normals_early_fusion for the six-channel RGB+normals model."
+        ),
+    )
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
     parser.add_argument("--checkpoint-steps", type=int, nargs="*")
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
@@ -160,6 +180,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("ego_view uses --intervention zero_image, not zero_geometry")
     if args.geometry_key != "ego_view" and args.intervention == "zero_image":
         parser.error("zero_image is only valid for ego_view")
+    if args.geometry_key == "ego_view" and args.rgb_contract is None:
+        parser.error("ego_view requires an explicit --rgb-contract")
+    if args.geometry_key != "ego_view" and args.rgb_contract is not None:
+        parser.error("--rgb-contract is only valid for ego_view")
+    if args.intervention == BRIGHTNESS_INTERVENTION:
+        if args.geometry_key != "ego_view":
+            parser.error("brightness_scale is only valid for ego_view")
+        if args.brightness_scale is None:
+            parser.error("brightness_scale requires --brightness-scale")
+        if not np.isfinite(args.brightness_scale) or not 0 < args.brightness_scale < 1:
+            parser.error(
+                "--brightness-scale must be finite and strictly between 0 and 1"
+            )
+    elif args.brightness_scale is not None:
+        parser.error(
+            "--brightness-scale is only valid for intervention=brightness_scale"
+        )
     if args.task:
         args.task = list(dict.fromkeys(value.strip() for value in args.task))
         if any(not value for value in args.task):
@@ -445,6 +482,7 @@ def _validate_contract(
     *,
     geometry_key: str,
     execution_horizon: int,
+    rgb_contract: str | None = None,
 ) -> int:
     spec = PolicyHorizonSpec.from_modality_config(
         modality, n_action_steps=execution_horizon
@@ -452,11 +490,20 @@ def _validate_contract(
     video = modality.get("video")
     if video is None:
         raise ValueError("Policy has no video modality")
-    expected_keys = (
-        ["ego_view", "surface_normals_view"]
-        if geometry_key == "ego_view"
-        else ["ego_view", geometry_key]
-    )
+    if geometry_key == "ego_view":
+        if rgb_contract == "rgb_only":
+            expected_keys = ["ego_view"]
+        elif rgb_contract == "rgb_normals_early_fusion":
+            expected_keys = ["ego_view", "surface_normals_view"]
+        else:
+            raise ValueError(
+                "ego_view requires rgb_contract='rgb_only' or "
+                "'rgb_normals_early_fusion'"
+            )
+    else:
+        if rgb_contract is not None:
+            raise ValueError("rgb_contract is only valid when replacing ego_view")
+        expected_keys = ["ego_view", geometry_key]
     if list(video.modality_keys) != expected_keys:
         raise ValueError(
             f"Expected video keys {expected_keys}, got {video.modality_keys}"
@@ -465,15 +512,20 @@ def _validate_contract(
         raise ValueError(
             f"Visual shuffle requires video delta_indices=[0], got {video.delta_indices}"
         )
-    if video.channel_fusion is None:
-        raise ValueError("Expected an early-fusion channel contract")
-    source_keys = [source.key for source in video.channel_fusion]
-    if source_keys != expected_keys:
-        raise ValueError(f"Unexpected channel-fusion sources: {source_keys}")
-    expected_channels = 4 if "depth_gray_view" in expected_keys else 6
+    if rgb_contract == "rgb_only":
+        if video.channel_fusion is not None:
+            raise ValueError("RGB-only contract must not use channel fusion")
+        expected_channels = 3
+    else:
+        if video.channel_fusion is None:
+            raise ValueError("Expected an early-fusion channel contract")
+        source_keys = [source.key for source in video.channel_fusion]
+        if source_keys != expected_keys:
+            raise ValueError(f"Unexpected channel-fusion sources: {source_keys}")
+        expected_channels = 4 if "depth_gray_view" in expected_keys else 6
     if video.vision_input_channels != expected_channels:
         raise ValueError(
-            f"Expected {expected_channels} fused channels for {expected_keys}, "
+            f"Expected {expected_channels} vision input channels for {expected_keys}, "
             f"got {video.vision_input_channels}"
         )
     for name, config in modality.items():
@@ -558,6 +610,20 @@ def zero_geometry_frame(target_frame: Any) -> np.ndarray:
 
     target = np.asarray(target_frame)
     return np.zeros_like(target)
+
+
+def scale_rgb_brightness(target_frame: Any, scale: float) -> np.ndarray:
+    """Dim uint8 sRGB bytes with deterministic round-half-up quantization."""
+
+    target = np.asarray(target_frame)
+    if target.dtype != np.uint8 or target.ndim != 3 or target.shape[-1] != 3:
+        raise ValueError(
+            f"Brightness scaling requires HxWx3 uint8 RGB, got {target.shape} {target.dtype}"
+        )
+    if not np.isfinite(scale) or not 0 < scale < 1:
+        raise ValueError("Brightness scale must be finite and strictly between 0 and 1")
+    scaled = np.floor(target.astype(np.float64) * scale + 0.5)
+    return np.ascontiguousarray(np.clip(scaled, 0, 255).astype(np.uint8))
 
 
 def _stack_columns(frame: pd.DataFrame, prefix: str, keys: Iterable[str]) -> np.ndarray:
@@ -686,6 +752,7 @@ def _evaluate_checkpoint(
     execution_horizon: int,
     pair_batch_size: int,
     inference_seed: int,
+    brightness_scale: float | None,
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
     action_keys = [str(key) for key in modality["action"].modality_keys]
     record_by_position = {record.loader_position: record for record in records}
@@ -717,7 +784,7 @@ def _evaluate_checkpoint(
             donor_trajectory = None
             donor_frames: dict[int, int] = {}
             replacement_episode_index = None
-            if intervention in ZERO_INTERVENTIONS:
+            if intervention in CURRENT_FRAME_INTERVENTIONS:
                 if assignment is not None or donor_loader is not None:
                     raise RuntimeError(
                         f"{intervention} must not construct or decode donors"
@@ -781,7 +848,7 @@ def _evaluate_checkpoint(
                 observations = []
                 seeds = []
                 for anchor in batch_anchors:
-                    if intervention in ZERO_INTERVENTIONS:
+                    if intervention in CURRENT_FRAME_INTERVENTIONS:
                         target_value = target_trajectory[f"video.{geometry_key}"].iloc[
                             anchor
                         ]
@@ -789,7 +856,16 @@ def _evaluate_checkpoint(
                             raise ValueError(
                                 f"Target visual input was not decoded for frame {anchor}"
                             )
-                        replacement_frame = zero_geometry_frame(target_value)
+                        if intervention in ZERO_INTERVENTIONS:
+                            replacement_frame = zero_geometry_frame(target_value)
+                        else:
+                            if brightness_scale is None:
+                                raise RuntimeError(
+                                    "brightness_scale intervention is missing its scale"
+                                )
+                            replacement_frame = scale_rgb_brightness(
+                                target_value, brightness_scale
+                            )
                     else:
                         assert donor_trajectory is not None
                         replacement_frame = donor_trajectory[
@@ -1215,7 +1291,22 @@ def _donor_manifest(
     assignments_by_repeat: dict[int, dict[int, DonorAssignment]],
     *,
     intervention: str,
+    brightness_scale: float | None = None,
 ) -> list[dict[str, Any]]:
+    if intervention == BRIGHTNESS_INTERVENTION:
+        if brightness_scale is None:
+            raise ValueError("brightness_scale manifest requires its numeric scale")
+        return [
+            {
+                "intervention": intervention,
+                "donor_required": False,
+                "replacement": (
+                    "same-frame ego_view digital sRGB-byte intensity scaling"
+                ),
+                "brightness_scale": brightness_scale,
+                "rounding_rule": BRIGHTNESS_ROUNDING_RULE,
+            }
+        ]
     if intervention in ZERO_INTERVENTIONS:
         return [
             {
@@ -1246,6 +1337,7 @@ def _frame_mapping(
     execution_horizon: int,
     *,
     intervention: str,
+    brightness_scale: float | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
     for repeat, assignments in sorted(assignments_by_repeat.items()):
@@ -1255,7 +1347,7 @@ def _frame_mapping(
                 recipient_progress = (
                     anchor / (recipient.length - 1) if recipient.length > 1 else 0.0
                 )
-                if intervention in ZERO_INTERVENTIONS:
+                if intervention in CURRENT_FRAME_INTERVENTIONS:
                     if assignment is not None:
                         raise RuntimeError(
                             f"{intervention} must not have donor assignments"
@@ -1264,7 +1356,18 @@ def _frame_mapping(
                     donor_frame = None
                     donor_episode_index = None
                     donor_length = None
-                    replacement_source = "all_zeros"
+                    replacement_source = (
+                        "same_frame_brightness_scale"
+                        if intervention == BRIGHTNESS_INTERVENTION
+                        else "all_zeros"
+                    )
+                    if (
+                        intervention == BRIGHTNESS_INTERVENTION
+                        and brightness_scale is None
+                    ):
+                        raise ValueError(
+                            "brightness_scale frame mapping requires its numeric scale"
+                        )
                 elif intervention in SAME_EPISODE_OFFSETS:
                     if assignment is not None:
                         raise RuntimeError(
@@ -1316,6 +1419,16 @@ def _frame_mapping(
                         "donor_episode_index": donor_episode_index,
                         "donor_length": donor_length,
                         "donor_frame": donor_frame,
+                        "brightness_scale": (
+                            brightness_scale
+                            if intervention == BRIGHTNESS_INTERVENTION
+                            else None
+                        ),
+                        "rounding_rule": (
+                            BRIGHTNESS_ROUNDING_RULE
+                            if intervention == BRIGHTNESS_INTERVENTION
+                            else None
+                        ),
                     }
                 )
     return rows
@@ -1483,6 +1596,25 @@ def _run_metadata(
                 "instantaneous correspondence with the other observation inputs"
             ),
         }
+    elif args.intervention == BRIGHTNESS_INTERVENTION:
+        intervention_detail = {
+            "name": args.intervention,
+            "replacement": "same-frame ego_view digital sRGB-byte intensity scaling",
+            "donor_rule": None,
+            "frame_rule": "same recipient episode and frame; no temporal or cross-episode donor",
+            "brightness_scale": args.brightness_scale,
+            "transform": (
+                "output_uint8 = clip(floor(input_uint8 * scale + 0.5), 0, 255)"
+            ),
+            "rounding_rule": BRIGHTNESS_ROUNDING_RULE,
+            "colour_space_semantics": "digital sRGB-byte intensity scaling",
+            "caveat": (
+                "not a radiometrically linear exposure change and not a physical "
+                "half-light or night simulation; it omits camera auto-exposure, shot/read "
+                "noise, motion blur, black-level and clipping effects, colour shifts, and "
+                "any dark-condition degradation of the paired depth or normals stream"
+            ),
+        }
     elif args.intervention in ZERO_INTERVENTIONS:
         is_rgb = args.geometry_key == "ego_view"
         intervention_detail = {
@@ -1503,7 +1635,7 @@ def _run_metadata(
     else:
         raise ValueError(f"Unknown intervention: {args.intervention}")
     return {
-        "version": 4,
+        "version": 5,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_seconds,
         "offline_only": True,
@@ -1596,6 +1728,7 @@ def main(argv: list[str] | None = None) -> int:
                 modality,
                 geometry_key=args.geometry_key,
                 execution_horizon=args.execution_horizon,
+                rgb_contract=args.rgb_contract,
             )
             signature = _modality_signature(modality)
             target_loader = LeRobotEpisodeLoader(
@@ -1603,7 +1736,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             donor_loader = (
                 None
-                if args.intervention in ZERO_INTERVENTIONS
+                if args.intervention in CURRENT_FRAME_INTERVENTIONS
                 else LeRobotEpisodeLoader(
                     args.dataset_path,
                     modality_configs=_donor_modality(modality, args.geometry_key),
@@ -1635,7 +1768,9 @@ def main(argv: list[str] | None = None) -> int:
                 _write_csv(
                     args.output_dir / "donor_manifest.csv",
                     _donor_manifest(
-                        assignments_by_repeat, intervention=args.intervention
+                        assignments_by_repeat,
+                        intervention=args.intervention,
+                        brightness_scale=args.brightness_scale,
                     ),
                 )
                 _write_csv(
@@ -1645,6 +1780,7 @@ def main(argv: list[str] | None = None) -> int:
                         assignments_by_repeat,
                         args.execution_horizon,
                         intervention=args.intervention,
+                        brightness_scale=args.brightness_scale,
                     ),
                 )
             elif signature != canonical_signature:
@@ -1670,6 +1806,7 @@ def main(argv: list[str] | None = None) -> int:
                 execution_horizon=args.execution_horizon,
                 pair_batch_size=args.pair_batch_size,
                 inference_seed=args.inference_seed,
+                brightness_scale=args.brightness_scale,
             )
             np.savez_compressed(checkpoint_dir / "frame_predictions.npz", **arrays)
             episode_condition = pd.DataFrame(condition_rows)
