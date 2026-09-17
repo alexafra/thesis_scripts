@@ -151,7 +151,42 @@ def verify_tree_snapshot(root: Path, snapshot_path: Path) -> None:
 CHECKPOINT_STATE = "component_checkpoint.json"
 CHECKPOINT_VERSION = 1
 CHECKPOINT_PHASE = "component_ready"
-CHECKPOINT_COMPONENT = "stack_red_cups_09_15"
+
+
+def _safe_component_name_from_environment() -> str:
+    value = os.environ.get(
+        "INSPIRE_APPEND_CHECKPOINT_COMPONENT", "stack_red_cups_09_15"
+    )
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) is None:
+        raise AppendSafetyError(
+            "INSPIRE_APPEND_CHECKPOINT_COMPONENT must be one safe directory name"
+        )
+    return value
+
+
+def _safe_provenance_relative_from_environment() -> Path:
+    value = os.environ.get(
+        "INSPIRE_APPEND_PROVENANCE_RELATIVE", "provenance/incremental_append"
+    )
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) < 2
+        or relative.parts[0] != "provenance"
+        or any(
+            part in {"", ".", ".."}
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part) is None
+            for part in relative.parts
+        )
+    ):
+        raise AppendSafetyError(
+            "INSPIRE_APPEND_PROVENANCE_RELATIVE must be a safe relative path below provenance/"
+        )
+    return relative
+
+
+CHECKPOINT_COMPONENT = _safe_component_name_from_environment()
+APPEND_PROVENANCE_RELATIVE = _safe_provenance_relative_from_environment()
 CHECKPOINT_BUILD = "final_build"
 CHECKPOINT_SNAPSHOTS = {
     "base": "provenance/base_tree_snapshot.json",
@@ -163,6 +198,7 @@ BUILD_CHECKPOINT_SNAPSHOTS = {
     "source": "provenance/source_tree_snapshot.json",
     "build": "provenance/build_tree_snapshot.json",
 }
+PUBLISHED_TREE_SNAPSHOT = "provenance/published_tree_snapshot.json"
 
 
 def _validated_snapshot_summary(path: Path) -> dict[str, Any]:
@@ -309,7 +345,7 @@ def _checkpoint_state(root: Path) -> dict[str, Any]:
     if state.get("version") != CHECKPOINT_VERSION:
         raise AppendSafetyError("Checkpoint state has an unsupported version")
     phase = state.get("phase")
-    if phase not in {CHECKPOINT_PHASE, "final_build_ready"}:
+    if phase not in {CHECKPOINT_PHASE, "final_build_ready", "publish_ready"}:
         raise AppendSafetyError(f"Checkpoint state has an unsupported phase: {phase!r}")
     common = {"version", "phase", "base_path", "source_path", "snapshots"}
     if phase == CHECKPOINT_PHASE:
@@ -321,7 +357,7 @@ def _checkpoint_state(root: Path) -> dict[str, Any]:
             or set(state["snapshots"]) != set(CHECKPOINT_SNAPSHOTS)
         ):
             raise AppendSafetyError("Component checkpoint state is malformed")
-    else:
+    elif phase == "final_build_ready":
         expected = common | {"build_relative_path"}
         if (
             set(state) != expected
@@ -330,6 +366,16 @@ def _checkpoint_state(root: Path) -> dict[str, Any]:
             or set(state["snapshots"]) != set(BUILD_CHECKPOINT_SNAPSHOTS)
         ):
             raise AppendSafetyError("Build checkpoint state is malformed")
+    else:
+        expected = common | {"build_relative_path", "published_snapshot"}
+        if (
+            set(state) != expected
+            or state.get("build_relative_path") != CHECKPOINT_BUILD
+            or not isinstance(state.get("snapshots"), dict)
+            or set(state["snapshots"]) != set(BUILD_CHECKPOINT_SNAPSHOTS)
+            or not isinstance(state.get("published_snapshot"), dict)
+        ):
+            raise AppendSafetyError("Publish-ready checkpoint state is malformed")
     if not isinstance(state.get("base_path"), str) or not isinstance(
         state.get("source_path"), str
     ):
@@ -350,13 +396,8 @@ def normalize_checkpoint(root: Path) -> None:
     build = root / CHECKPOINT_BUILD
     if phase == CHECKPOINT_PHASE:
         allowed = {CHECKPOINT_COMPONENT, CHECKPOINT_BUILD, "provenance", CHECKPOINT_STATE}
-    else:
-        detach_report = (
-            build
-            / "provenance"
-            / "incremental_append"
-            / "detach_report.json"
-        )
+    elif phase == "final_build_ready":
+        detach_report = build / APPEND_PROVENANCE_RELATIVE / "detach_report.json"
         if detach_report.is_symlink():
             raise AppendSafetyError(f"Detach report may not be a symlink: {detach_report}")
         if detach_report.exists():
@@ -381,6 +422,10 @@ def normalize_checkpoint(root: Path) -> None:
             "provenance",
             CHECKPOINT_STATE,
         }
+    else:
+        # publish_ready is already byte-sealed. A retry must not remove its
+        # detach report or any other file covered by the published snapshot.
+        allowed = {CHECKPOINT_BUILD, "provenance", CHECKPOINT_STATE}
     actual = {path.name for path in root.iterdir()}
     required = (
         {CHECKPOINT_COMPONENT, "provenance", CHECKPOINT_STATE}
@@ -392,6 +437,104 @@ def normalize_checkpoint(root: Path) -> None:
             f"Checkpoint root contains unexpected entries for {phase}: {sorted(actual - allowed)}"
         )
     print(f"Normalized retry-safe scratch at phase {phase}: {root}")
+
+
+def write_publish_ready_checkpoint(root: Path, base: Path, source: Path) -> None:
+    """Seal the exact detached tree immediately before its no-replace publication."""
+
+    root = root.expanduser().resolve()
+    base = base.expanduser().resolve()
+    source = source.expanduser().resolve()
+    prior = _checkpoint_state(root)
+    if prior["phase"] != "final_build_ready":
+        raise AppendSafetyError(
+            "Only a final-build-ready checkpoint may advance to publish-ready"
+        )
+    validate_retired_build_checkpoint(root, base, source)
+    build = root / CHECKPOINT_BUILD
+    published_path = root / PUBLISHED_TREE_SNAPSHOT
+    published = _validated_snapshot_summary(published_path)
+    actual = tree_summary(build)
+    actual_summary = {
+        key: actual[key] for key in ("file_count", "total_bytes", "tree_sha256")
+    }
+    if published != actual_summary:
+        raise AppendSafetyError("Published-candidate snapshot does not match final build")
+    state = {
+        **prior,
+        "phase": "publish_ready",
+        "published_snapshot": published,
+    }
+    _atomic_json(root / CHECKPOINT_STATE, state)
+    print(f"Sealed publish-ready checkpoint: {root}")
+
+
+def _validate_publish_ready_common(
+    root: Path,
+    base: Path,
+    source: Path,
+    published_tree: Path,
+    *,
+    build_present: bool,
+) -> None:
+    root = root.expanduser().resolve()
+    base = base.expanduser().resolve()
+    source = source.expanduser().resolve()
+    published_tree = published_tree.expanduser().resolve()
+    state = _checkpoint_state(root)
+    if state["phase"] != "publish_ready":
+        raise AppendSafetyError("Checkpoint is not sealed publish-ready")
+    if state.get("base_path") != str(base) or state.get("source_path") != str(source):
+        raise AppendSafetyError("Publish-ready checkpoint belongs to different inputs")
+    if (root / CHECKPOINT_COMPONENT).exists() or (root / CHECKPOINT_COMPONENT).is_symlink():
+        raise AppendSafetyError("Publish-ready checkpoint still contains its component")
+    expected_entries = {"provenance", CHECKPOINT_STATE}
+    if build_present:
+        expected_entries.add(CHECKPOINT_BUILD)
+    if {path.name for path in root.iterdir()} != expected_entries:
+        raise AppendSafetyError("Publish-ready checkpoint contains unexpected entries")
+    for name in ("base", "source"):
+        snapshot_path = root / BUILD_CHECKPOINT_SNAPSHOTS[name]
+        summary = _validated_snapshot_summary(snapshot_path)
+        if summary != state["snapshots"][name]:
+            raise AppendSafetyError(
+                f"Publish-ready {name} snapshot does not match sealed state"
+            )
+        verify_tree_snapshot({"base": base, "source": source}[name], snapshot_path)
+    build_snapshot = _validated_snapshot_summary(
+        root / BUILD_CHECKPOINT_SNAPSHOTS["build"]
+    )
+    if build_snapshot != state["snapshots"]["build"]:
+        raise AppendSafetyError("Pre-detach build snapshot does not match sealed state")
+    published_snapshot = _validated_snapshot_summary(root / PUBLISHED_TREE_SNAPSHOT)
+    if published_snapshot != state["published_snapshot"]:
+        raise AppendSafetyError("Published snapshot does not match sealed state")
+    actual = tree_summary(published_tree)
+    for key in ("file_count", "total_bytes", "tree_sha256"):
+        if actual[key] != published_snapshot[key]:
+            raise AppendSafetyError(
+                f"Published tree mismatch: {key}={actual[key]!r}, "
+                f"expected {published_snapshot[key]!r}"
+            )
+
+
+def validate_publish_ready_checkpoint(root: Path, base: Path, source: Path) -> None:
+    build = root.expanduser().resolve() / CHECKPOINT_BUILD
+    _validate_publish_ready_common(
+        root, base, source, build, build_present=True
+    )
+    print(f"Validated publish-ready checkpoint: {root}")
+
+
+def validate_published_target_checkpoint(
+    root: Path, base: Path, source: Path, target: Path
+) -> None:
+    if not target.expanduser().resolve().is_dir() or target.is_symlink():
+        raise AppendSafetyError(f"Published target is not a real directory: {target}")
+    _validate_publish_ready_common(
+        root, base, source, target, build_present=False
+    )
+    print(f"Validated published target left before checkpoint cleanup: {target}")
 
 
 def write_build_checkpoint(root: Path, base: Path, source: Path) -> None:
@@ -775,12 +918,16 @@ def record_provenance(
     output: Path,
     source_snapshot: Path,
     base_snapshot: Path,
-    stack_source_snapshot: Path,
-    words_source_snapshot: Path,
+    source_component_snapshots: list[tuple[str, Path]],
 ) -> None:
-    destination = output / "provenance" / "incremental_append"
+    destination = output / APPEND_PROVENANCE_RELATIVE
     if destination.exists() or destination.is_symlink():
         raise AppendSafetyError(f"Incremental provenance already exists: {destination}")
+    if not source_component_snapshots:
+        raise AppendSafetyError("At least one source-component snapshot is required")
+    source_names = [name for name, _ in source_component_snapshots]
+    if len(set(source_names)) != len(source_names):
+        raise AppendSafetyError("Source-component snapshot names must be unique")
     destination.mkdir(parents=True)
     shutil.copy2(base / "split_manifest.json", destination / "base_split_manifest.json")
     shutil.copy2(
@@ -790,10 +937,9 @@ def record_provenance(
     shutil.copy2(source_snapshot, destination / "source_tree_snapshot.json")
     shutil.copy2(base_snapshot, destination / "base_tree_snapshot.json")
     source_components = {}
-    for name, snapshot in (
-        ("stack_red_cups_09_15", stack_source_snapshot),
-        ("woorden_block_09_15", words_source_snapshot),
-    ):
+    for name, snapshot in source_component_snapshots:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None:
+            raise AppendSafetyError(f"Unsafe source-component name: {name!r}")
         target_name = f"{name}_source_tree_snapshot.json"
         shutil.copy2(snapshot, destination / target_name)
         source_components[name] = {
@@ -964,9 +1110,14 @@ def validate_training_stats(
         if relative_fingerprints.get(key) != _relative_fingerprint(key):
             raise AppendSafetyError(f"Relative stats fingerprint is stale for {key}")
 
-    append_manifest = _read_json(
-        dataset_root / "provenance" / "incremental_append" / "append_manifest.json"
-    )
+    report = report.expanduser().resolve()
+    try:
+        report.relative_to(dataset_root)
+    except ValueError as exc:
+        raise AppendSafetyError(
+            f"Statistics report must be inside the dataset root: {report}"
+        ) from exc
+    append_manifest = _read_json(report.parent / "append_manifest.json")
     expected_nontrain_hashes = append_manifest.get("nontrain_stats_sha256")
     actual_nontrain_hashes = {
         split: _file_sha256(dataset_root / split / "meta" / "stats.json")
@@ -1328,8 +1479,7 @@ def validate_final(
             raise AppendSafetyError(f"Final {split} does not preserve base episode order")
         embedded_component_episodes = _read_jsonl(
             output
-            / "provenance"
-            / "incremental_append"
+            / APPEND_PROVENANCE_RELATIVE
             / "component_metadata"
             / split
             / "episodes.jsonl"
@@ -1352,7 +1502,7 @@ def validate_final(
         ):
             raise AppendSafetyError(f"Final {split} calibration differs from base")
 
-    provenance = output / "provenance" / "incremental_append"
+    provenance = output / APPEND_PROVENANCE_RELATIVE
     if (provenance / "base_split_manifest.json").read_bytes() != (
         base / "split_manifest.json"
     ).read_bytes():
@@ -1437,6 +1587,24 @@ def _add_expected(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--frames", type=int, nargs=3, required=True, metavar=("TRAIN", "VALIDATION", "TEST"))
 
 
+def _source_component_snapshots(values: list[str]) -> list[tuple[str, Path]]:
+    result: list[tuple[str, Path]] = []
+    for value in values:
+        name, separator, snapshot_text = value.partition("=")
+        if (
+            not separator
+            or not snapshot_text
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None
+        ):
+            raise AppendSafetyError(
+                "--source-component must use SAFE_NAME=/path/to/tree_snapshot.json"
+            )
+        result.append((name, Path(snapshot_text)))
+    if len({name for name, _ in result}) != len(result):
+        raise AppendSafetyError("Duplicate --source-component name")
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1479,6 +1647,22 @@ def parse_args() -> argparse.Namespace:
     validate_build_checkpoint_parser.add_argument("--root", type=Path, required=True)
     validate_build_checkpoint_parser.add_argument("--base", type=Path, required=True)
     validate_build_checkpoint_parser.add_argument("--source", type=Path, required=True)
+
+    write_publish_ready = commands.add_parser("write-publish-ready-checkpoint")
+    write_publish_ready.add_argument("--root", type=Path, required=True)
+    write_publish_ready.add_argument("--base", type=Path, required=True)
+    write_publish_ready.add_argument("--source", type=Path, required=True)
+
+    validate_publish_ready = commands.add_parser("validate-publish-ready-checkpoint")
+    validate_publish_ready.add_argument("--root", type=Path, required=True)
+    validate_publish_ready.add_argument("--base", type=Path, required=True)
+    validate_publish_ready.add_argument("--source", type=Path, required=True)
+
+    validate_published = commands.add_parser("validate-published-target-checkpoint")
+    validate_published.add_argument("--root", type=Path, required=True)
+    validate_published.add_argument("--base", type=Path, required=True)
+    validate_published.add_argument("--source", type=Path, required=True)
+    validate_published.add_argument("--target", type=Path, required=True)
 
     retire_component = commands.add_parser("retire-component-after-build")
     retire_component.add_argument("--root", type=Path, required=True)
@@ -1524,8 +1708,12 @@ def parse_args() -> argparse.Namespace:
     provenance.add_argument("--output", type=Path, required=True)
     provenance.add_argument("--source-snapshot", type=Path, required=True)
     provenance.add_argument("--base-snapshot", type=Path, required=True)
-    provenance.add_argument("--stack-source-snapshot", type=Path, required=True)
-    provenance.add_argument("--words-source-snapshot", type=Path, required=True)
+    provenance.add_argument(
+        "--source-component",
+        action="append",
+        required=True,
+        metavar="SAFE_NAME=SNAPSHOT",
+    )
 
     clear_stats = commands.add_parser("clear-training-stats")
     clear_stats.add_argument("--train-root", type=Path, required=True)
@@ -1580,6 +1768,14 @@ def main() -> int:
         write_build_checkpoint(args.root, args.base, args.source)
     elif args.command == "validate-build-checkpoint":
         validate_build_checkpoint(args.root, args.base, args.source)
+    elif args.command == "write-publish-ready-checkpoint":
+        write_publish_ready_checkpoint(args.root, args.base, args.source)
+    elif args.command == "validate-publish-ready-checkpoint":
+        validate_publish_ready_checkpoint(args.root, args.base, args.source)
+    elif args.command == "validate-published-target-checkpoint":
+        validate_published_target_checkpoint(
+            args.root, args.base, args.source, args.target
+        )
     elif args.command == "retire-component-after-build":
         retire_component_after_build(args.root, args.base, args.source)
     elif args.command == "validate-retired-build-checkpoint":
@@ -1606,8 +1802,7 @@ def main() -> int:
             args.output,
             args.source_snapshot,
             args.base_snapshot,
-            args.stack_source_snapshot,
-            args.words_source_snapshot,
+            _source_component_snapshots(args.source_component),
         )
     elif args.command == "clear-training-stats":
         clear_training_stats(args.train_root)

@@ -12,7 +12,7 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 SUPPORT = SCRIPTS_DIR / "inspire_incremental_append_support.py"
 PIPELINE = SCRIPTS_DIR / "append_inspire_stack_0915.sh"
-V2_BASE_NAME = "all_tasks_452eps_20260915_normals_range_mask_v2"
+V2_BASE_NAME = "all_tasks_655eps_20260916_normals_range_mask_v2"
 
 
 def run_support(*arguments: object, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -79,17 +79,21 @@ def fake_pipeline_environment(
     fail_detach_once: bool = False,
     fail_append_once: bool = False,
     fail_build_snapshot_once: bool = False,
+    fail_after_publish_once: bool = False,
 ) -> tuple[dict[str, str], dict[str, Path]]:
     dataset_parent = tmp_path / "lerobot2" / "inspire"
-    base = dataset_parent / "base_452"
-    source = tmp_path / "processed_raw" / "stack_red_cups_09_15"
-    words_source = tmp_path / "processed_raw" / "woorden_block_09_15"
-    target = dataset_parent / "target_655"
+    base = dataset_parent / "base_655"
+    source = tmp_path / "processed_raw" / "cup_pyramid_09_16"
+    words_source = tmp_path / "processed_raw" / "toothpaste_09_16"
+    target = dataset_parent / "target_713"
     (base / "train" / "data").mkdir(parents=True)
     (base / "train" / "data" / "base.bin").write_bytes(b"base-bytes")
     (base / "split_manifest.json").write_text(
         '{"version": 1, "episodes": []}\n', encoding="utf-8"
     )
+    legacy_provenance = base / "provenance" / "incremental_append" / "legacy.txt"
+    legacy_provenance.parent.mkdir(parents=True)
+    legacy_provenance.write_bytes(b"sealed-655-provenance\n")
     source.mkdir(parents=True)
     (source / "raw.bin").write_bytes(b"source-bytes")
     (source / "split_manifest.json").write_text(
@@ -120,6 +124,9 @@ with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as handle:
 def value(flag):
     return Path(args[args.index(flag) + 1])
 
+component_name = os.environ["INSPIRE_APPEND_CHECKPOINT_COMPONENT"]
+append_provenance = Path(os.environ["INSPIRE_APPEND_PROVENANCE_RELATIVE"])
+
 if command == "snapshot-tree":
     root = value("--root")
     fail_marker = Path(os.environ["FAIL_BUILD_SNAPSHOT_MARKER"])
@@ -148,18 +155,22 @@ elif command == "normalize-checkpoint":
         (
             root
             / "final_build"
-            / "provenance"
-            / "incremental_append"
+            / append_provenance
             / "detach_report.json"
         ).unlink(missing_ok=True)
 elif command == "validate-component-checkpoint":
     root = value("--root")
-    if (root / "corrupt.marker").exists() or not (root / "stack_red_cups_09_15").is_dir():
+    if (root / "corrupt.marker").exists() or not (root / component_name).is_dir():
         raise SystemExit(31)
 elif command == "write-build-checkpoint":
     root = value("--root")
     (root / "component_checkpoint.json").write_text(
         '{"version": 1, "phase": "final_build_ready"}\\n', encoding="utf-8"
+    )
+elif command == "write-publish-ready-checkpoint":
+    root = value("--root")
+    (root / "component_checkpoint.json").write_text(
+        '{"version": 1, "phase": "publish_ready"}\\n', encoding="utf-8"
     )
 elif command == "validate-build-checkpoint":
     root = value("--root")
@@ -169,15 +180,15 @@ elif command == "retire-component-after-build":
     root = value("--root")
     if not (root / "final_build").is_dir():
         raise SystemExit(33)
-    shutil.rmtree(root / "stack_red_cups_09_15", ignore_errors=True)
+    shutil.rmtree(root / component_name, ignore_errors=True)
     marker = root / "provenance" / "component_retirement.json"
     marker.write_text('{"retired": true}\\n', encoding="utf-8")
 elif command == "validate-retired-build-checkpoint":
     root = value("--root")
-    if (root / "stack_red_cups_09_15").exists() or not (root / "final_build").is_dir():
+    if (root / component_name).exists() or not (root / "final_build").is_dir():
         raise SystemExit(34)
 elif command == "record-provenance":
-    output = value("--output") / "provenance" / "incremental_append"
+    output = value("--output") / append_provenance
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(value("--base") / "split_manifest.json", output / "base_split_manifest.json")
     shutil.copy2(value("--component") / "split_manifest.json", output / "component_split_manifest.json")
@@ -214,6 +225,10 @@ elif command == "publish-no-replace":
     if target.exists() or target.is_symlink():
         raise SystemExit(17)
     build.rename(target)
+    fail_marker = Path(os.environ["FAIL_AFTER_PUBLISH_MARKER"])
+    if os.environ.get("FAIL_AFTER_PUBLISH_ONCE") == "1" and not fail_marker.exists():
+        fail_marker.write_text("failed once\\n", encoding="utf-8")
+        raise SystemExit(74)
 """,
     )
     splitter = tmp_path / "split.py"
@@ -240,7 +255,7 @@ elif command == "publish-no-replace":
         "marker=Path(os.environ['FAIL_APPEND_MARKER'])\n"
         "if os.environ.get('FAIL_APPEND_ONCE') == '1' and not marker.exists(): marker.write_text('failed once\\n',encoding='utf-8'); raise SystemExit(72)\n"
         "args=[value for value in sys.argv[1:] if value != '--link-media']\n"
-        "(Path(args[0]) / 'appended.marker').write_text('203 combined\\n', encoding='utf-8')\n",
+        "(Path(args[0]) / 'appended.marker').write_text('58 combined\\n', encoding='utf-8')\n",
     )
     quiet_pgrep = tmp_path / "quiet-pgrep.sh"
     write_executable(quiet_pgrep, "#!/usr/bin/env bash\nexit 1\n")
@@ -259,12 +274,13 @@ elif command == "publish-no-replace":
     fail_marker = tmp_path / "detach-failed-once.marker"
     fail_append_marker = tmp_path / "append-failed-once.marker"
     fail_build_snapshot_marker = tmp_path / "build-snapshot-failed-once.marker"
+    fail_after_publish_marker = tmp_path / "after-publish-failed-once.marker"
     environment = {
         **os.environ,
         "DATASET_PARENT": str(dataset_parent),
         "BASE_DATASET": str(base),
-        "STACK_SOURCE": str(source),
-        "WORDS_SOURCE": str(words_source),
+        "PYRAMID_SOURCE": str(source),
+        "TOOTHPASTE_SOURCE": str(words_source),
         "TARGET_DATASET": str(target),
         "RUN_ID": run_id,
         "LOG_ROOT": str(log_root),
@@ -280,8 +296,9 @@ elif command == "publish-no-replace":
         "UV": str(fake_uv),
         "MODALITY_CONFIG": str(modality_config),
         "MIN_FREE_GIB": "1",
+        "DETACH_HEADROOM_GIB": "1",
         "FAKE_LOG": str(fake_log),
-        "EXPECTED_COMPONENT": str(checkpoint / "stack_red_cups_09_15"),
+        "EXPECTED_COMPONENT": str(checkpoint / "cup_pyramid_and_toothpaste_09_16"),
         "RACE_TARGET": "1" if race_target else "0",
         "FAIL_DETACH_ONCE": "1" if fail_detach_once else "0",
         "FAIL_MARKER": str(fail_marker),
@@ -289,6 +306,8 @@ elif command == "publish-no-replace":
         "FAIL_APPEND_MARKER": str(fail_append_marker),
         "FAIL_BUILD_SNAPSHOT_ONCE": "1" if fail_build_snapshot_once else "0",
         "FAIL_BUILD_SNAPSHOT_MARKER": str(fail_build_snapshot_marker),
+        "FAIL_AFTER_PUBLISH_ONCE": "1" if fail_after_publish_once else "0",
+        "FAIL_AFTER_PUBLISH_MARKER": str(fail_after_publish_marker),
     }
     return environment, {
         "base": base,
@@ -840,11 +859,11 @@ def test_check_defaults_to_migrated_v2_base_and_pins_converter_v2(
         "convert --preflight-only --include-surface-normals "
         "--surface-normals-encoding-version 2 --end-effector inspire-ftp "
         "--camera-calibration-profile d435i-254322071415 "
-        f"{paths['source']} stack_red_cups_09_15 6",
+        f"{paths['source']} cup_pyramid_09_16 6",
         "convert --preflight-only --include-surface-normals "
         "--surface-normals-encoding-version 2 --end-effector inspire-ftp "
         "--camera-calibration-profile d435i-254322071415 "
-        f"{paths['words_source']} woorden_block_09_15 6",
+        f"{paths['words_source']} toothpaste_09_16 6",
     ]
 
 
@@ -869,7 +888,7 @@ def test_build_failure_retains_hidden_work_and_preserves_inputs(
         paths["work"]
         / "provenance"
         / "source_bundle"
-        / "stack_red_cups_09_15"
+        / "cup_pyramid_09_16"
         / "raw.bin"
     ).read_bytes() == source_before
     assert not paths["build"].exists()
@@ -900,8 +919,18 @@ def test_build_retires_component_after_seal_then_cleans_after_publish(
     target_payload = paths["target"] / base_payload.relative_to(paths["base"])
     assert target_payload.read_bytes() == base_payload.read_bytes()
     assert target_payload.stat().st_ino != base_payload.stat().st_ino
-    assert (paths["target"] / "appended.marker").read_text(encoding="utf-8") == "203 combined\n"
-    assert (paths["target"] / "provenance" / "incremental_append" / "detach_report.json").is_file()
+    assert (paths["target"] / "appended.marker").read_text(encoding="utf-8") == "58 combined\n"
+    generation = (
+        paths["target"]
+        / "provenance"
+        / "incremental_append_generations"
+        / "20260917_cup_pyramid_and_toothpaste_09_16"
+    )
+    assert (generation / "detach_report.json").is_file()
+    assert (generation / "append_manifest.json").is_file()
+    assert (
+        paths["target"] / "provenance" / "incremental_append" / "legacy.txt"
+    ).read_bytes() == b"sealed-655-provenance\n"
 
     calls = paths["log"].read_text(encoding="utf-8").splitlines()
     detach_index = next(index for index, line in enumerate(calls) if "support detach-and-verify" in line)
@@ -921,9 +950,9 @@ def test_build_retires_component_after_seal_then_cleans_after_publish(
         if "support retire-component-after-build" in line
     )
     assert retire_index < detach_index
-    assert "--episodes 161 21 21" in calls[final_validate_indices[-1]]
-    assert "--frames 110957 13296 13712" in calls[final_validate_indices[-1]]
-    assert "Final population: train=525/196453, validation=65/22719, test=65/24566" in result.stdout
+    assert "--episodes 46 6 6" in calls[final_validate_indices[-1]]
+    assert "--frames 35383 5540 4196" in calls[final_validate_indices[-1]]
+    assert "Final population: train=571/231836, validation=71/28259, test=71/28762" in result.stdout
     combined_calls = "\n".join(calls)
     convert_calls = [line for line in calls if line.startswith("convert ")]
     assert len(convert_calls) == 3
@@ -956,7 +985,7 @@ def test_detach_failure_retains_sealed_final_build_after_component_retirement(
 
     assert result.returncode == 71
     assert not paths["target"].exists()
-    assert not (paths["checkpoint"] / "stack_red_cups_09_15").exists()
+    assert not (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").exists()
     assert (paths["checkpoint"] / "final_build").is_dir()
     assert (paths["checkpoint"] / "final_build" / "appended.marker").is_file()
 
@@ -992,7 +1021,7 @@ def test_crash_after_final_build_move_rolls_forward_without_deleting_payload(
     checkpoint = paths["checkpoint"]
     state = json.loads((checkpoint / "component_checkpoint.json").read_text())
     assert state["phase"] == "component_ready"
-    assert (checkpoint / "stack_red_cups_09_15").is_dir()
+    assert (checkpoint / "cup_pyramid_and_toothpaste_09_16").is_dir()
     assert (checkpoint / "final_build" / "appended.marker").is_file()
 
     resumed = subprocess.run(
@@ -1006,7 +1035,7 @@ def test_crash_after_final_build_move_rolls_forward_without_deleting_payload(
     assert resumed.returncode == 0, resumed.stderr
     assert paths["target"].is_dir()
     assert (paths["target"] / "appended.marker").read_text(encoding="utf-8") == (
-        "203 combined\n"
+        "58 combined\n"
     )
     calls = paths["log"].read_text(encoding="utf-8")
     assert "support validate-orphan-final-build-checkpoint" in calls
@@ -1028,7 +1057,7 @@ def test_append_failure_retains_hidden_build_and_component(tmp_path: Path) -> No
     assert not paths["target"].exists()
     assert paths["build"].is_dir()
     assert (paths["build"] / "train" / "data" / "base.bin").is_file()
-    assert (paths["checkpoint"] / "stack_red_cups_09_15").is_dir()
+    assert (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").is_dir()
 
 
 def test_startup_refuses_and_lists_existing_unsealed_scratch(tmp_path: Path) -> None:
@@ -1073,7 +1102,7 @@ def test_target_created_at_publish_boundary_is_never_replaced(tmp_path: Path) ->
     assert (paths["target"] / "racer.txt").read_text(encoding="utf-8") == "must survive\n"
     assert not paths["work"].exists()
     assert not paths["build"].exists()
-    assert not (paths["checkpoint"] / "stack_red_cups_09_15").exists()
+    assert not (paths["checkpoint"] / "cup_pyramid_and_toothpaste_09_16").exists()
     assert (paths["checkpoint"] / "final_build").is_dir()
     calls = paths["log"].read_text(encoding="utf-8")
     assert "support publish-no-replace" in calls
