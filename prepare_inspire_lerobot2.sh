@@ -29,6 +29,7 @@ CONVERT_SCRIPT="${CONVERT_SCRIPT:-$SCRIPT_DIR/convert_to_lerobot2.sh}"
 SPLIT_SCRIPT="${SPLIT_SCRIPT:-$SCRIPT_DIR/split_dataset.py}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-$SCRIPT_DIR/multi_finetune_evaluation.sh}"
 DATA_EDITOR_PGREP="${DATA_EDITOR_PGREP:-pgrep}"
+ALLOW_FULL_RECONVERSION="${ALLOW_FULL_RECONVERSION:-0}"
 declare -a EXCLUDED_DATASETS=()
 declare -a PRESERVED_SPLITS=()
 
@@ -74,6 +75,8 @@ Options (the matching uppercase environment variable may be used instead):
   --preserve-split LEAF=MANIFEST
                             Preserve one child's prior split membership/order while
                             refreshing its hashes/goals/frame counts; repeatable.
+  --allow-full-reconversion Explicitly authorize collection mode to reconvert every
+                            selected leaf. Incremental additions must use append.
   -h, --help                Show this help.
 
 Depth range environment overrides:
@@ -89,6 +92,10 @@ Collection mode excludes only explicitly named child datasets. It refuses
 symlinks, nested wrappers, duplicate episode hashes/capture IDs, and an active
 data_editor_EN_rgbd.py process. It snapshots hashes before/after copying, builds
 one combined raw split tree, and invokes full conversion exactly once.
+
+Adding a new leaf to an existing converted corpus is an append, not a collection
+reconversion. Collection convert/all therefore requires --allow-full-reconversion,
+which is reserved for an intentional first build or from-scratch rebuild.
 
 Example:
   prepare_inspire_lerobot2.sh convert \
@@ -263,6 +270,10 @@ while [[ $# -gt 0 ]]; do
             PRESERVED_SPLITS+=("${1#*=}")
             shift
             ;;
+        --allow-full-reconversion)
+            ALLOW_FULL_RECONVERSION=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -306,6 +317,11 @@ elif [[ ${#EXCLUDED_DATASETS[@]} -gt 0 || ${#PRESERVED_SPLITS[@]} -gt 0 ]]; then
     die "--exclude-dataset and --preserve-split require --collection-source."
 fi
 
+if [[ "$COLLECTION_MODE" == 1 && ( "$MODE" == convert || "$MODE" == all ) && \
+      "$ALLOW_FULL_RECONVERSION" != 1 ]]; then
+    die "Collection conversion would reconvert every selected leaf. If a converted base already exists, use an append pipeline. Pass --allow-full-reconversion only for an intentional from-scratch collection build."
+fi
+
 if [[ -n "$DATASET_NAME" ]]; then
     SOURCE_ROOT="${SOURCE_ROOT:-$DATASETS_ROOT/processed_raw/inspire/$DATASET_NAME}"
     DATASET_ROOT="${DATASET_ROOT:-$DATASETS_ROOT/lerobot2/inspire/$DATASET_NAME}"
@@ -315,6 +331,8 @@ fi
 [[ "$SPLIT_SEARCH_TRIALS" =~ ^[1-9][0-9]*$ ]] || \
     die "--split-search-trials must be a positive integer."
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer."
+[[ "$ALLOW_FULL_RECONVERSION" == 0 || "$ALLOW_FULL_RECONVERSION" == 1 ]] || \
+    die "ALLOW_FULL_RECONVERSION must be 0 or 1."
 [[ -n "$CAMERA_CALIBRATION_PROFILE" ]] || \
     die "--camera-calibration-profile must not be empty."
 case "$CAMERA_CALIBRATION_PROFILE" in

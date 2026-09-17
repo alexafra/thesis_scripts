@@ -117,6 +117,25 @@ def hardlink_or_copy(source: str, destination: str) -> str:
         return shutil.copy2(source, destination)
 
 
+def hardlink_required(source: str, destination: str) -> str:
+    """Create one required hard link without silently consuming copy space."""
+
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        raise MergeError(
+            f"Required media hard link failed for {source} -> {destination}: {exc}"
+        ) from exc
+    return destination
+
+
+def copy_payload_file(source: Path, destination: Path, *, link_media: bool) -> None:
+    if link_media:
+        hardlink_required(str(source), str(destination))
+    else:
+        shutil.copy2(source, destination)
+
+
 def clone_existing(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=hardlink_or_copy, symlinks=True)
 
@@ -797,6 +816,8 @@ def copy_reindexed_lz4_episode(
     old_episode_index: int,
     new_episode_index: int,
     length: int,
+    *,
+    link_media: bool = False,
 ) -> None:
     validate_lz4_episode(
         source,
@@ -811,7 +832,11 @@ def copy_reindexed_lz4_episode(
     )
     require_new_path(destination_episode)
     destination_episode.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_episode, destination_episode, copy_function=shutil.copy2)
+    shutil.copytree(
+        source_episode,
+        destination_episode,
+        copy_function=hardlink_required if link_media else shutil.copy2,
+    )
     index_path = destination_episode / "index.json"
     index = read_json(index_path)
     index["episode_index"] = new_episode_index
@@ -823,7 +848,7 @@ def copy_reindexed_lz4_episode(
     )
     require_new_path(destination_backup)
     destination_backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_backup, destination_backup)
+    copy_payload_file(source_backup, destination_backup, link_media=link_media)
     validate_lz4_episode(destination, destination_info, new_episode_index, length)
 
 
@@ -864,7 +889,12 @@ def refresh_lz4_metadata(root: Path, info: dict[str, Any]) -> None:
     atomic_write_json(root / "meta" / "info.json.h264_backup", h264_info)
 
 
-def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
+def append_one(
+    destination: Path,
+    source: Path,
+    *,
+    link_media: bool = False,
+) -> tuple[int, int, int]:
     destination_info, destination_tasks, destination_episodes, destination_stats = load_metadata(destination)
     source_info, source_tasks, source_episodes, source_stats = load_metadata(source)
     validate_tasks(destination_tasks, destination)
@@ -925,13 +955,14 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                     old_episode_index,
                     new_episode_index,
                     length,
+                    link_media=link_media,
                 )
                 continue
             source_video = video_path(source, source_info, old_episode_index, key)
             destination_video = video_path(destination, destination_info, new_episode_index, key)
             require_new_path(destination_video)
             destination_video.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_video, destination_video)
+            copy_payload_file(source_video, destination_video, link_media=link_media)
         if raw_depth_encoding(destination_info) is not None:
             for frame_index in range(length):
                 source_raw_depth = raw_depth_path(
@@ -948,7 +979,11 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                 )
                 require_new_path(destination_raw_depth)
                 destination_raw_depth.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_raw_depth, destination_raw_depth)
+                copy_payload_file(
+                    source_raw_depth,
+                    destination_raw_depth,
+                    link_media=link_media,
+                )
         if aligned_depth_encoding(destination_info) is not None:
             for frame_index in range(length):
                 source_aligned_depth = aligned_depth_path(
@@ -965,7 +1000,11 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
                 )
                 require_new_path(destination_aligned_depth)
                 destination_aligned_depth.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_aligned_depth, destination_aligned_depth)
+                copy_payload_file(
+                    source_aligned_depth,
+                    destination_aligned_depth,
+                    link_media=link_media,
+                )
 
         new_episode = dict(source_episode)
         new_episode["episode_index"] = new_episode_index
@@ -1010,7 +1049,12 @@ def append_one(destination: Path, source: Path) -> tuple[int, int, int]:
     return len(source_episodes), int(source_info["total_frames"]), len(destination_tasks)
 
 
-def merge_direct_in_stage(stage: Path, sources: list[Path]) -> tuple[int, int]:
+def merge_direct_in_stage(
+    stage: Path,
+    sources: list[Path],
+    *,
+    link_media: bool = False,
+) -> tuple[int, int]:
     added_episodes = 0
     added_frames = 0
     if not is_dataset(stage):
@@ -1024,7 +1068,7 @@ def merge_direct_in_stage(stage: Path, sources: list[Path]) -> tuple[int, int]:
         validate_dataset(stage)
     for source in sources:
         validate_dataset(source)
-        episodes, frames, _ = append_one(stage, source)
+        episodes, frames, _ = append_one(stage, source, link_media=link_media)
         added_episodes += episodes
         added_frames += frames
     validate_dataset(stage)
@@ -1224,7 +1268,12 @@ def destination_split_path(root: Path, logical_name: str) -> Path:
     return root / "validation"
 
 
-def merge_split_root_in_stage(stage: Path, sources: list[Path]) -> tuple[int, int]:
+def merge_split_root_in_stage(
+    stage: Path,
+    sources: list[Path],
+    *,
+    link_media: bool = False,
+) -> tuple[int, int]:
     provenance: list[dict[str, Any]] = []
     episode_offsets = {split: 0 for split in SPLIT_NAMES}
     frame_offsets = {split: 0 for split in SPLIT_NAMES}
@@ -1248,7 +1297,11 @@ def merge_split_root_in_stage(stage: Path, sources: list[Path]) -> tuple[int, in
         if not incoming:
             continue
         destination_split = destination_split_path(stage, logical_name)
-        episodes, frames = merge_direct_in_stage(destination_split, incoming)
+        episodes, frames = merge_direct_in_stage(
+            destination_split,
+            incoming,
+            link_media=link_media,
+        )
         total_episodes += episodes
         total_frames += frames
     if not split_dirs(stage):
@@ -1257,7 +1310,13 @@ def merge_split_root_in_stage(stage: Path, sources: list[Path]) -> tuple[int, in
     return total_episodes, total_frames
 
 
-def atomic_merge(destination: Path, sources: list[Path], mode: str) -> tuple[int, int]:
+def atomic_merge(
+    destination: Path,
+    sources: list[Path],
+    mode: str,
+    *,
+    link_media: bool = False,
+) -> tuple[int, int]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     stage = destination.parent / f".{destination.name}.merge-{uuid.uuid4().hex}"
     backup = destination.parent / f".{destination.name}.backup-{uuid.uuid4().hex}"
@@ -1268,9 +1327,13 @@ def atomic_merge(destination: Path, sources: list[Path], mode: str) -> tuple[int
         else:
             stage.mkdir()
         if mode == "dataset":
-            result = merge_direct_in_stage(stage, sources)
+            result = merge_direct_in_stage(stage, sources, link_media=link_media)
         else:
-            result = merge_split_root_in_stage(stage, sources)
+            result = merge_split_root_in_stage(
+                stage,
+                sources,
+                link_media=link_media,
+            )
 
         if destination_existed:
             os.replace(destination, backup)
@@ -1295,6 +1358,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("destination", type=Path, help="Dataset or split root that absorbs the sources")
     parser.add_argument("sources", type=Path, nargs="+", help="One or more v2.1 datasets or split roots")
+    parser.add_argument(
+        "--link-media",
+        action="store_true",
+        help=(
+            "Hard-link immutable incoming video/depth/LZ4 payload while rewriting "
+            "Parquet and metadata. Fails instead of copying across filesystems."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1320,7 +1391,12 @@ def main() -> int:
 
     label = "dataset" if source_mode == "dataset" else "split root"
     print(f"Merging {len(sources)} LeRobot v2.1 {label}(s) into {destination}")
-    episodes, frames = atomic_merge(destination, sources, source_mode)
+    episodes, frames = atomic_merge(
+        destination,
+        sources,
+        source_mode,
+        link_media=args.link_media,
+    )
     print(f"Done: copied {episodes} episode(s) and {frames} frame(s). Sources were not changed.")
     return 0
 

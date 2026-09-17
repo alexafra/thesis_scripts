@@ -356,6 +356,7 @@ def test_collection_convert_preserves_one_split_and_excludes_exact_dataset(
             "convert",
             "--collection-source",
             str(source),
+            "--allow-full-reconversion",
             "--output",
             str(output),
             "--repo-id",
@@ -493,6 +494,7 @@ def test_collection_convert_refuses_active_data_editor(tmp_path: Path) -> None:
             "convert",
             "--collection-source",
             str(source),
+            "--allow-full-reconversion",
             "--output",
             str(output),
         ],
@@ -504,6 +506,37 @@ def test_collection_convert_refuses_active_data_editor(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Close every data_editor_EN_rgbd.py" in result.stderr
+    assert not output.exists()
+    assert not Path(environment["CONVERT_LOG"]).exists()
+
+
+def test_collection_convert_requires_explicit_full_reconversion_authorization(
+    tmp_path: Path,
+) -> None:
+    environment = _fake_environment(tmp_path)
+    source = tmp_path / "processed_raw" / "inspire"
+    _make_unique_raw(source / "existing_task", "existing", 3)
+    _make_unique_raw(source / "new_task", "new", 2)
+    output = tmp_path / "output"
+
+    result = subprocess.run(
+        [
+            str(PIPELINE),
+            "convert",
+            "--collection-source",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "use an append pipeline" in result.stderr
+    assert "--allow-full-reconversion" in result.stderr
     assert not output.exists()
     assert not Path(environment["CONVERT_LOG"]).exists()
 

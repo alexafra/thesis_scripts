@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -520,6 +521,76 @@ class AppendLerobot2AlignedDepthTest(unittest.TestCase):
             self.assertNotIn("surface_normals_lz4", h264_info)
             self.assertEqual(tree_digest(first), first_digest)
             self.assertEqual(tree_digest(second), second_digest)
+
+    def test_link_media_adopts_payload_without_linking_mutable_indexes_or_parquet(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
+            temporary = Path(temporary_dir)
+            first = temporary / "first"
+            second = temporary / "second"
+            destination = temporary / "combined"
+            make_dataset(first / "train", b"first")
+            make_dataset(second / "train", b"second")
+            add_canonical_lz4_normals(first / "train", b"first")
+            add_canonical_lz4_normals(second / "train", b"second")
+            self.run_append(destination, first)
+            source_digest = tree_digest(second)
+
+            self.run_append("--link-media", destination, second)
+
+            source = second / "train"
+            output = destination / "train"
+            source_info = json.loads((source / "meta" / "info.json").read_text())
+            output_info = json.loads((output / "meta" / "info.json").read_text())
+
+            source_video = source / source_info["video_path"].format(
+                episode_chunk=0,
+                episode_index=0,
+                video_key="observation.images.ego_view",
+            )
+            output_video = output / output_info["video_path"].format(
+                episode_chunk=1,
+                episode_index=1,
+                video_key="observation.images.ego_view",
+            )
+            source_raw = sidecar_path(source, RAW_DEPTH_TEMPLATE, 0, 0)
+            output_raw = sidecar_path(output, RAW_DEPTH_TEMPLATE, 1, 0)
+            source_aligned = sidecar_path(source, ALIGNED_DEPTH_TEMPLATE, 0, 0)
+            output_aligned = sidecar_path(output, ALIGNED_DEPTH_TEMPLATE, 1, 0)
+            source_lz4 = (
+                source
+                / source_info["surface_normals_lz4"]["root"]
+                / "episode_000000"
+                / "chunk_000000.lz4"
+            )
+            output_lz4 = (
+                output
+                / output_info["surface_normals_lz4"]["root"]
+                / "episode_000001"
+                / "chunk_000000.lz4"
+            )
+            source_index = source_lz4.with_name("index.json")
+            output_index = output_lz4.with_name("index.json")
+            source_parquet = source / "data/chunk-000/episode_000000.parquet"
+            output_parquet = output / "data/chunk-001/episode_000001.parquet"
+
+            for source_path, output_path in (
+                (source_video, output_video),
+                (source_raw, output_raw),
+                (source_aligned, output_aligned),
+                (source_lz4, output_lz4),
+            ):
+                self.assertEqual(source_path.stat().st_ino, output_path.stat().st_ino)
+            self.assertNotEqual(source_index.stat().st_ino, output_index.stat().st_ino)
+            self.assertNotEqual(source_parquet.stat().st_ino, output_parquet.stat().st_ino)
+            self.assertEqual(
+                json.loads(output_index.read_text())["episode_index"],
+                1,
+            )
+            self.assertEqual(tree_digest(second), source_digest)
+
+            shutil.rmtree(second)
+            self.assertEqual(output_video.read_bytes(), b"video-second")
+            self.assertEqual(output_lz4.read_bytes(), b"lz4-second")
 
     def test_aligned_depth_metadata_must_be_compatible(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary_dir:
