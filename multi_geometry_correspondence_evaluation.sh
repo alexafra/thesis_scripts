@@ -59,6 +59,7 @@ done
 RGBD_MODEL="${RGBD_MODEL:-$MODEL_ROOT/c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 NORMALS_MODEL="${NORMALS_MODEL:-$MODEL_ROOT/c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
 RGB_MODEL="${RGB_MODEL:-$MODEL_ROOT/c_rgb_patch_tuned_bf16_batch_32_acc_1_30k_${RUN_SUFFIX}}"
+LATE_NORMALS_MODEL="${LATE_NORMALS_MODEL:-$MODEL_ROOT/c_rgb_surface_normals_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_25k_${RUN_SUFFIX}}"
 
 INTERVENES_ON_RGB=0
 case "$MODE" in
@@ -67,6 +68,7 @@ case "$MODE" in
         GEOMETRY_KEYS=("ego_view")
         REQUIRED_VIDEO_KEYS=("ego_view")
         RGB_CONTRACTS=("rgb_only")
+        VISION_CONTRACTS=("rgb_only")
         LABELS=("rgb")
         INTERVENES_ON_RGB=1
         ;;
@@ -75,6 +77,7 @@ case "$MODE" in
         GEOMETRY_KEYS=("ego_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
         RGB_CONTRACTS=("rgb_normals_early_fusion")
+        VISION_CONTRACTS=("early_fusion")
         LABELS=("rgb_in_rgb_normals")
         INTERVENES_ON_RGB=1
         ;;
@@ -83,6 +86,7 @@ case "$MODE" in
         GEOMETRY_KEYS=("depth_gray_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view")
         RGB_CONTRACTS=("")
+        VISION_CONTRACTS=("early_fusion")
         LABELS=("rgbd")
         ;;
     normals)
@@ -90,17 +94,36 @@ case "$MODE" in
         GEOMETRY_KEYS=("surface_normals_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
         RGB_CONTRACTS=("")
+        VISION_CONTRACTS=("early_fusion")
         LABELS=("rgb_normals")
+        ;;
+    late_normals)
+        MODEL_DIRS=("$LATE_NORMALS_MODEL")
+        GEOMETRY_KEYS=("surface_normals_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
+        RGB_CONTRACTS=("")
+        VISION_CONTRACTS=("late_fusion_pre_adapter")
+        LABELS=("rgb_normals_late_pre")
+        ;;
+    rgb_in_late_normals)
+        MODEL_DIRS=("$LATE_NORMALS_MODEL")
+        GEOMETRY_KEYS=("ego_view")
+        REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")
+        RGB_CONTRACTS=("rgb_normals_late_fusion_pre_adapter")
+        VISION_CONTRACTS=("late_fusion_pre_adapter")
+        LABELS=("rgb_in_rgb_normals_late_pre")
+        INTERVENES_ON_RGB=1
         ;;
     both)
         MODEL_DIRS=("$RGBD_MODEL" "$NORMALS_MODEL")
         GEOMETRY_KEYS=("depth_gray_view" "surface_normals_view")
         REQUIRED_VIDEO_KEYS=("ego_view" "depth_gray_view" "surface_normals_view")
         RGB_CONTRACTS=("" "")
+        VISION_CONTRACTS=("early_fusion" "early_fusion")
         LABELS=("rgbd" "rgb_normals")
         ;;
     *)
-        echo "ERROR: MODE must be rgb, rgb_in_normals, depth, normals, or both; got $MODE" >&2
+        echo "ERROR: MODE must be rgb, rgb_in_normals, depth, normals, late_normals, rgb_in_late_normals, or both; got $MODE" >&2
         exit 1
         ;;
 esac
@@ -111,11 +134,11 @@ for intervention in "${INTERVENTIONS[@]}"; do
         exit 1
     fi
     if [[ "$INTERVENES_ON_RGB" != "1" && "$intervention" == "zero_image" ]]; then
-        echo "ERROR: zero_image is only valid with MODE=rgb or MODE=rgb_in_normals" >&2
+        echo "ERROR: zero_image is only valid with MODE=rgb, rgb_in_normals, or rgb_in_late_normals" >&2
         exit 1
     fi
     if [[ "$INTERVENES_ON_RGB" != "1" && "$intervention" == "brightness_scale" ]]; then
-        echo "ERROR: brightness_scale is only valid with MODE=rgb or MODE=rgb_in_normals" >&2
+        echo "ERROR: brightness_scale is only valid with MODE=rgb, rgb_in_normals, or rgb_in_late_normals" >&2
         exit 1
     fi
 done
@@ -228,7 +251,8 @@ validate_checkpoint_artifacts() {
     local checkpoint=$1
     local view_key=$2
     local rgb_contract=$3
-    "$GROOT_PYTHON" - "$checkpoint" "$view_key" "$rgb_contract" <<'PY'
+    local vision_contract=$4
+    "$GROOT_PYTHON" - "$checkpoint" "$view_key" "$rgb_contract" "$vision_contract" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -236,6 +260,7 @@ import sys
 checkpoint = Path(sys.argv[1])
 view_key = sys.argv[2]
 rgb_contract = sys.argv[3] or None
+vision_contract = sys.argv[4]
 required = (
     "config.json",
     "embodiment_id.json",
@@ -260,19 +285,19 @@ bad_shards = [
 if bad_shards:
     raise SystemExit(f"Checkpoint model index references missing/empty shards: {bad_shards}")
 processor = json.loads((checkpoint / "processor_config.json").read_text(encoding="utf-8"))
+model = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
 try:
     video = processor["processor_kwargs"]["modality_configs"]["new_embodiment"]["video"]
 except KeyError as exc:
     raise SystemExit(f"Checkpoint lacks the NEW_EMBODIMENT video contract: {exc}") from exc
 if view_key == "ego_view" and rgb_contract == "rgb_only":
     expected_keys = ["ego_view"]
-    expect_fusion = False
 elif view_key == "ego_view" and rgb_contract == "rgb_normals_early_fusion":
     expected_keys = ["ego_view", "surface_normals_view"]
-    expect_fusion = True
+elif view_key == "ego_view" and rgb_contract == "rgb_normals_late_fusion_pre_adapter":
+    expected_keys = ["ego_view", "surface_normals_view"]
 elif view_key != "ego_view" and rgb_contract is None:
     expected_keys = ["ego_view", view_key]
-    expect_fusion = True
 else:
     raise SystemExit(
         f"Invalid view/contract request: view_key={view_key!r}, rgb_contract={rgb_contract!r}"
@@ -284,14 +309,50 @@ if video.get("modality_keys") != expected_keys:
 if video.get("delta_indices") != [0]:
     raise SystemExit(f"Checkpoint video delta_indices must be [0], got {video.get('delta_indices')}")
 fusion = video.get("channel_fusion")
-if expect_fusion:
+post_vision_fusion = video.get("post_vision_fusion", False)
+post_vision_fusion_stage = video.get("post_vision_fusion_stage")
+if vision_contract == "rgb_only":
+    if fusion is not None or post_vision_fusion or post_vision_fusion_stage is not None:
+        raise SystemExit(
+            "RGB-only checkpoint unexpectedly declares an early- or late-fusion contract"
+        )
+elif vision_contract == "early_fusion":
     if not isinstance(fusion, list) or [source.get("key") for source in fusion] != expected_keys:
         raise SystemExit(f"Checkpoint channel_fusion does not exactly match {expected_keys}: {fusion}")
-elif fusion is not None:
-    raise SystemExit(f"RGB-only checkpoint unexpectedly uses channel_fusion: {fusion}")
+    if post_vision_fusion or post_vision_fusion_stage is not None:
+        raise SystemExit("Early-fusion checkpoint unexpectedly declares post-vision fusion")
+elif vision_contract == "late_fusion_pre_adapter":
+    if fusion is not None:
+        raise SystemExit(f"Late-fusion checkpoint unexpectedly uses channel_fusion: {fusion}")
+    if post_vision_fusion is not True:
+        raise SystemExit("Late-fusion checkpoint must set post_vision_fusion=true")
+    expected_stage = "pre_vision_language_adapter"
+    if post_vision_fusion_stage != expected_stage:
+        raise SystemExit(
+            "Late-fusion processor stage mismatch: "
+            f"got {post_vision_fusion_stage!r}, expected {expected_stage!r}"
+        )
+    if model.get("vision_fusion_mode") != "post_vision_late_fusion":
+        raise SystemExit(
+            "Late-fusion model must set vision_fusion_mode='post_vision_late_fusion'"
+        )
+    if model.get("vision_fusion_source_keys") != expected_keys:
+        raise SystemExit(
+            "Late-fusion model source-key mismatch: "
+            f"got {model.get('vision_fusion_source_keys')!r}, expected {expected_keys!r}"
+        )
+    if model.get("vision_fusion_stage") != expected_stage:
+        raise SystemExit(
+            "Late-fusion model stage mismatch: "
+            f"got {model.get('vision_fusion_stage')!r}, expected {expected_stage!r}"
+        )
+    if model.get("tune_vision_patch_embed") is not False:
+        raise SystemExit("Late-fusion model must keep the shared RGB patch embedding frozen")
+else:
+    raise SystemExit(f"Unsupported vision contract: {vision_contract!r}")
 print(
     f"Checkpoint artifacts and visual contract complete: {checkpoint.name} "
-    f"({len(shards)} shards, keys={expected_keys})"
+    f"({len(shards)} shards, keys={expected_keys}, contract={vision_contract})"
 )
 PY
 }
@@ -302,6 +363,7 @@ for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
     rgb_contract="${RGB_CONTRACTS[$i]}"
+    vision_contract="${VISION_CONTRACTS[$i]}"
     summary="$model_dir/evaluation_exec_hor_8/checkpoint_metric_summary.csv"
     if [[ ! -d "$model_dir" ]]; then
         echo "WAITING: ${LABELS[$i]} model directory is not ready: $model_dir" >&2
@@ -325,7 +387,7 @@ for i in "${!MODEL_DIRS[@]}"; do
             echo "ERROR: selected checkpoint is missing: $model_dir/checkpoint-$selected" >&2
             exit 1
         }
-        validate_checkpoint_artifacts "$model_dir/checkpoint-$selected" "$geometry_key" "$rgb_contract"
+        validate_checkpoint_artifacts "$model_dir/checkpoint-$selected" "$geometry_key" "$rgb_contract" "$vision_contract"
     done
     SELECTED_STEPS+=("$step")
     echo "READY: ${LABELS[$i]} view=$geometry_key checkpoint(s)=$step"
@@ -415,6 +477,7 @@ for i in "${!MODEL_DIRS[@]}"; do
     model_dir="${MODEL_DIRS[$i]}"
     geometry_key="${GEOMETRY_KEYS[$i]}"
     rgb_contract="${RGB_CONTRACTS[$i]}"
+    vision_contract="${VISION_CONTRACTS[$i]}"
     step="${SELECTED_STEPS[$i]}"
     read -r -a checkpoint_args <<< "$step"
     rgb_contract_args=()
@@ -429,6 +492,7 @@ for i in "${!MODEL_DIRS[@]}"; do
         echo "Model: $model_dir"
         echo "View key: $geometry_key only"
         echo "RGB contract: ${rgb_contract:-not-applicable}"
+        echo "Vision contract: $vision_contract"
         echo "Intervention: $intervention"
         echo "Held-out split: $DATASET_PATH"
         echo "Checkpoint(s): $step"

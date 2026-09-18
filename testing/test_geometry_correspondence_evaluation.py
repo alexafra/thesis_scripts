@@ -2,9 +2,9 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
 
+from gr00t.data.types import VideoChannelSource
 import numpy as np
 import pandas as pd
-from gr00t.data.types import VideoChannelSource
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "geometry_correspondence_evaluation.py"
@@ -392,6 +392,79 @@ def test_rgb_and_early_fusion_visual_contracts_remain_distinct():
             raise AssertionError(f"mismatched RGB contract accepted: {contract}")
 
 
+def test_pre_adapter_late_fusion_contract_supports_independent_rgb_and_normals():
+    shared = {
+        "state": geometry.ModalityConfig(delta_indices=[0], modality_keys=["state"]),
+        "action": geometry.ModalityConfig(
+            delta_indices=list(range(8)), modality_keys=["action"]
+        ),
+        "language": geometry.ModalityConfig(
+            delta_indices=[0], modality_keys=["annotation.human.task_description"]
+        ),
+    }
+    late_fusion = {
+        **shared,
+        "video": geometry.ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["ego_view", "surface_normals_view"],
+            post_vision_fusion=True,
+            post_vision_fusion_stage="pre_vision_language_adapter",
+        ),
+    }
+
+    assert (
+        geometry._validate_contract(
+            late_fusion,
+            geometry_key="ego_view",
+            execution_horizon=8,
+            rgb_contract="rgb_normals_late_fusion_pre_adapter",
+        )
+        == 8
+    )
+    assert (
+        geometry._validate_contract(
+            late_fusion,
+            geometry_key="surface_normals_view",
+            execution_horizon=8,
+        )
+        == 8
+    )
+
+
+def test_late_fusion_ablation_rejects_post_adapter_stage():
+    modality = {
+        "video": geometry.ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["ego_view", "surface_normals_view"],
+            post_vision_fusion=True,
+            post_vision_fusion_stage="post_vision_language_adapter",
+        ),
+        "state": geometry.ModalityConfig(delta_indices=[0], modality_keys=["state"]),
+        "action": geometry.ModalityConfig(
+            delta_indices=list(range(8)), modality_keys=["action"]
+        ),
+        "language": geometry.ModalityConfig(
+            delta_indices=[0], modality_keys=["annotation.human.task_description"]
+        ),
+    }
+
+    for geometry_key, rgb_contract in (
+        ("ego_view", "rgb_normals_late_fusion_pre_adapter"),
+        ("surface_normals_view", None),
+    ):
+        try:
+            geometry._validate_contract(
+                modality,
+                geometry_key=geometry_key,
+                execution_horizon=8,
+                rgb_contract=rgb_contract,
+            )
+        except ValueError as exc:
+            assert "pre-adapter late fusion" in str(exc)
+        else:
+            raise AssertionError("post-adapter late fusion must fail the pre-adapter contract")
+
+
 def test_rgb_metadata_declares_only_rgb_changed():
     assert geometry.unchanged_inputs_for_visual_intervention(
         "ego_view", ["ego_view", "surface_normals_view"]
@@ -497,13 +570,18 @@ def test_runner_is_evaluation_only_and_supports_selected_interventions_for_all_m
         'REQUIRED_VIDEO_KEYS=("ego_view" "surface_normals_view")',
         'RGB_CONTRACTS=("rgb_only")',
         'RGB_CONTRACTS=("rgb_normals_early_fusion")',
+        'RGB_CONTRACTS=("rgb_normals_late_fusion_pre_adapter")',
+        'VISION_CONTRACTS=("late_fusion_pre_adapter")',
         'INTERVENTIONS_CSV="${INTERVENTIONS_CSV:-phase_matched,out_of_phase,zero_geometry}"',
         'BRIGHTNESS_SCALE="${BRIGHTNESS_SCALE:-}"',
         "offset_10pct | offset_50pct | zero_geometry | zero_image",
         "brightness_scale)",
         'NORMALS_MODEL="${NORMALS_MODEL:-',
+        'LATE_NORMALS_MODEL="${LATE_NORMALS_MODEL:-',
         "rgb)",
         "rgb_in_normals)",
+        "late_normals)",
+        "rgb_in_late_normals)",
         'DATASET_SCOPE="validation"',
         'DATASET_PATH="$DATASET_ROOT/validation"',
         "--view-key",

@@ -48,7 +48,11 @@ import torch
 LOGGER = logging.getLogger("geometry_correspondence_evaluation")
 GEOMETRY_KEYS = ("depth_gray_view", "surface_normals_view")
 VISUAL_KEYS = ("ego_view", *GEOMETRY_KEYS)
-RGB_CONTRACTS = ("rgb_only", "rgb_normals_early_fusion")
+RGB_CONTRACTS = (
+    "rgb_only",
+    "rgb_normals_early_fusion",
+    "rgb_normals_late_fusion_pre_adapter",
+)
 CROSS_EPISODE_INTERVENTIONS = ("phase_matched", "out_of_phase")
 SAME_EPISODE_OFFSETS = {"offset_10pct": 0.10, "offset_50pct": 0.50}
 ZERO_INTERVENTIONS = ("zero_geometry", "zero_image")
@@ -130,7 +134,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=RGB_CONTRACTS,
         help=(
             "Required when replacing ego_view: rgb_only for a three-channel RGB "
-            "model, or rgb_normals_early_fusion for the six-channel RGB+normals model."
+            "model, rgb_normals_early_fusion for the six-channel RGB+normals model, "
+            "or rgb_normals_late_fusion_pre_adapter for the separately encoded "
+            "RGB+normals pre-adapter model."
         ),
     )
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
@@ -490,20 +496,34 @@ def _validate_contract(
     video = modality.get("video")
     if video is None:
         raise ValueError("Policy has no video modality")
+    contract: str
     if geometry_key == "ego_view":
         if rgb_contract == "rgb_only":
             expected_keys = ["ego_view"]
         elif rgb_contract == "rgb_normals_early_fusion":
             expected_keys = ["ego_view", "surface_normals_view"]
+        elif rgb_contract == "rgb_normals_late_fusion_pre_adapter":
+            expected_keys = ["ego_view", "surface_normals_view"]
         else:
             raise ValueError(
                 "ego_view requires rgb_contract='rgb_only' or "
-                "'rgb_normals_early_fusion'"
+                "'rgb_normals_early_fusion' or "
+                "'rgb_normals_late_fusion_pre_adapter'"
             )
+        contract = str(rgb_contract)
     else:
         if rgb_contract is not None:
             raise ValueError("rgb_contract is only valid when replacing ego_view")
         expected_keys = ["ego_view", geometry_key]
+        if video.channel_fusion is not None:
+            contract = "geometry_early_fusion"
+        elif video.post_vision_fusion:
+            contract = "geometry_late_fusion_pre_adapter"
+        else:
+            raise ValueError(
+                "Two-view geometry intervention requires either early channel fusion "
+                "or pre-adapter late fusion"
+            )
     if list(video.modality_keys) != expected_keys:
         raise ValueError(
             f"Expected video keys {expected_keys}, got {video.modality_keys}"
@@ -512,17 +532,37 @@ def _validate_contract(
         raise ValueError(
             f"Visual shuffle requires video delta_indices=[0], got {video.delta_indices}"
         )
-    if rgb_contract == "rgb_only":
+    if contract == "rgb_only":
         if video.channel_fusion is not None:
             raise ValueError("RGB-only contract must not use channel fusion")
+        if video.post_vision_fusion:
+            raise ValueError("RGB-only contract must not use post-vision fusion")
         expected_channels = 3
-    else:
+    elif contract in {"rgb_normals_early_fusion", "geometry_early_fusion"}:
         if video.channel_fusion is None:
             raise ValueError("Expected an early-fusion channel contract")
+        if video.post_vision_fusion:
+            raise ValueError("Early fusion must not also use post-vision fusion")
         source_keys = [source.key for source in video.channel_fusion]
         if source_keys != expected_keys:
             raise ValueError(f"Unexpected channel-fusion sources: {source_keys}")
         expected_channels = 4 if "depth_gray_view" in expected_keys else 6
+    elif contract in {
+        "rgb_normals_late_fusion_pre_adapter",
+        "geometry_late_fusion_pre_adapter",
+    }:
+        if video.channel_fusion is not None:
+            raise ValueError("Late fusion must not also use channel fusion")
+        if not video.post_vision_fusion:
+            raise ValueError("Expected a post-vision late-fusion contract")
+        if video.post_vision_fusion_stage != "pre_vision_language_adapter":
+            raise ValueError(
+                "This evaluation requires pre-adapter late fusion, got "
+                f"{video.post_vision_fusion_stage!r}"
+            )
+        expected_channels = 3
+    else:
+        raise ValueError(f"Unsupported visual contract: {contract}")
     if video.vision_input_channels != expected_channels:
         raise ValueError(
             f"Expected {expected_channels} vision input channels for {expected_keys}, "
@@ -1502,6 +1542,12 @@ def _modality_signature(modality: dict[str, ModalityConfig]) -> dict[str, Any]:
             "delta_indices": [int(value) for value in config.delta_indices],
             "vision_channel_layout": (
                 config.vision_channel_layout if name == "video" else None
+            ),
+            "post_vision_fusion": (
+                bool(config.post_vision_fusion) if name == "video" else None
+            ),
+            "post_vision_fusion_stage": (
+                config.post_vision_fusion_stage if name == "video" else None
             ),
         }
         for name, config in modality.items()
