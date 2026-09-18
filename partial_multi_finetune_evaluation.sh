@@ -72,6 +72,10 @@ for experiment in "${REQUESTED_EXPERIMENTS[@]}"; do
             MODEL_DIRS+=("$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}")
             REQUIRED_CHECKPOINT_STEPS+=("${FINAL_CHECKPOINT_STEP:-25000}")
             ;;
+        rgbd_turbo_late_fusion_pre_adapter)
+            MODEL_DIRS+=("$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_turbo_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}")
+            REQUIRED_CHECKPOINT_STEPS+=("${FINAL_CHECKPOINT_STEP:-25000}")
+            ;;
         rgbd_late_fusion_post_adapter)
             MODEL_DIRS+=("$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}")
             REQUIRED_CHECKPOINT_STEPS+=("${FINAL_CHECKPOINT_STEP:-25000}")
@@ -86,7 +90,7 @@ for experiment in "${REQUESTED_EXPERIMENTS[@]}"; do
             ;;
         *)
             echo "Error: unsupported EXPERIMENTS entry: $experiment" >&2
-            echo "Supported: missed_normals rgbd_late_fusion_pre_adapter rgbd_late_fusion_post_adapter normals_late_fusion_pre_adapter normals_late_fusion_post_adapter" >&2
+            echo "Supported: missed_normals rgbd_late_fusion_pre_adapter rgbd_turbo_late_fusion_pre_adapter rgbd_late_fusion_post_adapter normals_late_fusion_pre_adapter normals_late_fusion_post_adapter" >&2
             exit 1
             ;;
     esac

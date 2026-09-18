@@ -9,18 +9,20 @@ PARTIAL = SCRIPTS_ROOT / "partial_multi_finetune_evaluation.sh"
 
 LATE_EXPERIMENTS = (
     "rgbd_late_fusion_pre_adapter",
+    "rgbd_turbo_late_fusion_pre_adapter",
     "rgbd_late_fusion_post_adapter",
     "normals_late_fusion_pre_adapter",
     "normals_late_fusion_post_adapter",
 )
 
 
-def test_multi_late_fusion_is_opt_in_and_uses_the_four_existing_configs() -> None:
+def test_multi_late_fusion_is_opt_in_and_uses_the_five_existing_configs() -> None:
     source = MULTI.read_text(encoding="utf-8")
 
     assert 'EXPERIMENTS="${EXPERIMENTS:-rgb,normals,depth}"' in source
     expected_configs = (
         "g1_inspire_head_rgbd_late_fusion_pre_adapter_config.py",
+        "g1_inspire_head_rgbd_turbo_late_fusion_pre_adapter_config.py",
         "g1_inspire_head_rgbd_late_fusion_post_adapter_config.py",
         "g1_inspire_head_rgb_surface_normals_late_fusion_pre_adapter_config.py",
         "g1_inspire_head_rgb_surface_normals_late_fusion_post_adapter_config.py",
@@ -40,8 +42,8 @@ def test_multi_late_fusion_names_encode_the_frozen_four_adapter_contract() -> No
 
     for experiment in LATE_EXPERIMENTS:
         assert experiment in model_dirs
-    assert model_dirs.count("4x_linear_rgb50_geo50_patch_frozen") == 4
-    assert patch_flags.count('"--no-tune-vision-patch-embed"') == 4
+    assert model_dirs.count("4x_linear_rgb50_geo50_patch_frozen") == 5
+    assert patch_flags.count('"--no-tune-vision-patch-embed"') == 5
     assert "--no-tune-llm" in source
     assert "--no-tune-visual" in source
     assert "--tune-projector" in source
@@ -61,6 +63,7 @@ def test_late_fusion_requires_the_geometry_feature_used_by_each_pair() -> None:
         )
     ]
     assert "rgbd_late_fusion_pre_adapter" in depth_guard
+    assert "rgbd_turbo_late_fusion_pre_adapter" in depth_guard
     assert "rgbd_late_fusion_post_adapter" in depth_guard
     assert "normals_late_fusion_pre_adapter" in normals_guard
     assert "normals_late_fusion_post_adapter" in normals_guard
@@ -73,7 +76,7 @@ def test_partial_uses_the_same_late_fusion_model_names_without_training() -> Non
     for experiment in LATE_EXPERIMENTS:
         assert experiment in multi_source
         assert experiment in partial_source
-    assert partial_source.count("4x_linear_rgb50_geo50_patch_frozen") == 4
+    assert partial_source.count("4x_linear_rgb50_geo50_patch_frozen") == 5
     assert "gr00t.experiment.launch_finetune" not in partial_source
     assert "scripts.analysis_tools.evaluate_checkpoints" in partial_source
     assert 'EXPERIMENTS="${EXPERIMENTS:-missed_normals}"' in partial_source

@@ -109,6 +109,7 @@ MODALITY_CONFIGS=(
     "examples/UnitreeG1/${CONFIG_PREFIX}_head_4_channel_gray_depth_fusion_config.py"
     "examples/UnitreeG1/${CONFIG_PREFIX}_head_6_channel_surface_normals_fusion_config.py"
     "examples/UnitreeG1/g1_inspire_head_rgbd_late_fusion_pre_adapter_config.py"
+    "examples/UnitreeG1/g1_inspire_head_rgbd_turbo_late_fusion_pre_adapter_config.py"
     "examples/UnitreeG1/g1_inspire_head_rgbd_late_fusion_post_adapter_config.py"
     "examples/UnitreeG1/g1_inspire_head_rgb_surface_normals_late_fusion_pre_adapter_config.py"
     "examples/UnitreeG1/g1_inspire_head_rgb_surface_normals_late_fusion_post_adapter_config.py"
@@ -119,6 +120,7 @@ MODEL_DIRS=(
     "$MODEL_ROOT/${MODEL_PREFIX}c_d1_4ch_early_fusion_patch_tuned_depth_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$MODEL_ROOT/${MODEL_PREFIX}c_normals_6ch_early_fusion_patch_tuned_normals_init_rgb_mean_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
+    "$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_turbo_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$MODEL_ROOT/${MODEL_PREFIX}c_rgbd_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$MODEL_ROOT/${MODEL_PREFIX}c_rgb_surface_normals_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
     "$MODEL_ROOT/${MODEL_PREFIX}c_rgb_surface_normals_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen_bf16_batch_32_acc_1_${RUN_LABEL}_${RUN_SUFFIX}"
@@ -132,18 +134,20 @@ PATCH_EMBED_FLAGS=(
     "--no-tune-vision-patch-embed"
     "--no-tune-vision-patch-embed"
     "--no-tune-vision-patch-embed"
+    "--no-tune-vision-patch-embed"
 )
 
-LOAD_BF16_FLAGS=(1 1 1 1 1 1 1)
-BATCH_SIZES=(32 32 32 32 32 32 32)
-ACCUMULATION_STEPS=(1 1 1 1 1 1 1)
-PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean" "" "" "" "")
-INCLUDE_BASE_MODEL=(1 0 0 0 0 0 0)
+LOAD_BF16_FLAGS=(1 1 1 1 1 1 1 1)
+BATCH_SIZES=(32 32 32 32 32 32 32 32)
+ACCUMULATION_STEPS=(1 1 1 1 1 1 1 1)
+PATCH_INIT_MODES=("" "rgb_mean" "rgb_mean" "" "" "" "" "")
+INCLUDE_BASE_MODEL=(1 0 0 0 0 0 0 0)
 EXPERIMENT_NAMES=(
     rgb
     depth
     normals
     rgbd_late_fusion_pre_adapter
+    rgbd_turbo_late_fusion_pre_adapter
     rgbd_late_fusion_post_adapter
     normals_late_fusion_pre_adapter
     normals_late_fusion_post_adapter
@@ -159,9 +163,10 @@ for experiment in "${REQUESTED_EXPERIMENTS[@]}"; do
         depth) index=1 ;;
         normals) index=2 ;;
         rgbd_late_fusion_pre_adapter) index=3 ;;
-        rgbd_late_fusion_post_adapter) index=4 ;;
-        normals_late_fusion_pre_adapter) index=5 ;;
-        normals_late_fusion_post_adapter) index=6 ;;
+        rgbd_turbo_late_fusion_pre_adapter) index=4 ;;
+        rgbd_late_fusion_post_adapter) index=5 ;;
+        normals_late_fusion_pre_adapter) index=6 ;;
+        normals_late_fusion_post_adapter) index=7 ;;
         *)
             echo "Error: unsupported EXPERIMENTS entry: $experiment" >&2
             echo "Supported: ${EXPERIMENT_NAMES[*]}" >&2
@@ -205,6 +210,7 @@ fi
 REQUIRED_FEATURES=(observation.images.ego_view)
 if [[ -n "${SELECTED_EXPERIMENT_SET[depth]:-}" ||
       -n "${SELECTED_EXPERIMENT_SET[rgbd_late_fusion_pre_adapter]:-}" ||
+      -n "${SELECTED_EXPERIMENT_SET[rgbd_turbo_late_fusion_pre_adapter]:-}" ||
       -n "${SELECTED_EXPERIMENT_SET[rgbd_late_fusion_post_adapter]:-}" ]]; then
     REQUIRED_FEATURES+=(observation.images.depth_gray_view)
 fi
