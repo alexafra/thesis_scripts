@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Replace canonical surface-normal MP4 folders with verified plain LZ4.
 
-The MP4 folders are retained beside the LZ4 folders with an ``_h264_backup``
-suffix.  Conversion is resumable and no canonical path or metadata is changed
-until every requested split has been converted and verified.
+The MP4 folders are retained only until the verified LZ4 commit succeeds, then
+removed by default. Use ``--keep-h264-backup`` to retain the original MP4s.
+Conversion is resumable and no canonical path or metadata is changed until
+every requested split has been converted and verified.
 """
 
 from __future__ import annotations
@@ -50,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         choices=("train", "validation", "test"),
     )
     parser.add_argument("--chunk-frames", type=int, default=32)
+    parser.add_argument(
+        "--keep-h264-backup",
+        action="store_true",
+        help="Retain original normals MP4s and metadata after the LZ4 commit.",
+    )
     parser.add_argument(
         "--jobs",
         type=int,
@@ -283,7 +289,7 @@ def prepare_split(
     building = video_parent / f".{FEATURE_KEY}.lz4-building"
 
     configured = info.get("surface_normals_lz4")
-    if backup.is_dir() and canonical.is_dir() and configured:
+    if canonical.is_dir() and configured:
         print(f"[{split}] already installed; validating existing LZ4", flush=True)
         total_frames = 0
         total_bytes = 0
@@ -428,7 +434,11 @@ def prepare_split(
     }
 
 
-def commit_split(prepared: dict[str, Any], chunk_frames: int) -> None:
+def commit_split(
+    prepared: dict[str, Any],
+    chunk_frames: int,
+    keep_h264_backup: bool = False,
+) -> None:
     if prepared["already_installed"]:
         return
     split = prepared["split"]
@@ -436,7 +446,7 @@ def commit_split(prepared: dict[str, Any], chunk_frames: int) -> None:
     canonical: Path = prepared["canonical"]
     backup: Path = prepared["backup"]
     building: Path = prepared["building"]
-    info: dict[str, Any] = prepared["info"]
+    info: dict[str, Any] = dict(prepared["info"])
 
     info_backup = info_path.with_name("info.json.h264_backup")
     if info_backup.exists():
@@ -451,31 +461,55 @@ def commit_split(prepared: dict[str, Any], chunk_frames: int) -> None:
         "layout": "FHWC",
         "chunk_frames": chunk_frames,
         "lossless_round_trip_verified": True,
-        "h264_backup": str(backup.relative_to(prepared["split_root"])),
     }
+    if keep_h264_backup:
+        info["surface_normals_lz4"]["h264_backup"] = str(
+            backup.relative_to(prepared["split_root"])
+        )
     pending_info = info_path.with_name(f".{info_path.name}.lz4-ready-{os.getpid()}")
-    pending_info.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
 
-    canonical.rename(backup)
+    source_moved = False
+    lz4_moved = False
     try:
+        pending_info.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+        canonical.rename(backup)
+        source_moved = True
         building.rename(canonical)
+        lz4_moved = True
+        manifest_path = canonical / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["canonical_commit_pending"] = False
+        manifest["canonical_lz4_path"] = str(canonical)
+        if keep_h264_backup:
+            manifest["h264_backup_path"] = str(backup)
+        else:
+            manifest.pop("h264_backup_path", None)
+        write_json_atomic(manifest_path, manifest)
+        # Publish metadata last, while the complete H.264 rollback copy exists.
         os.replace(pending_info, info_path)
     except BaseException:
-        if canonical.exists() and not building.exists():
+        if lz4_moved:
             canonical.rename(building)
-        if backup.exists() and not canonical.exists():
+        if source_moved:
             backup.rename(canonical)
         pending_info.unlink(missing_ok=True)
         shutil.copy2(info_backup, info_path)
+        info_backup.unlink()
         raise
 
-    manifest_path = canonical / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["canonical_commit_pending"] = False
-    manifest["canonical_lz4_path"] = str(canonical)
-    manifest["h264_backup_path"] = str(backup)
-    write_json_atomic(manifest_path, manifest)
-    print(f"[{split}] COMMITTED LZ4 canonical; H.264 retained at {backup}", flush=True)
+    if keep_h264_backup:
+        print(f"[{split}] COMMITTED LZ4 canonical; H.264 retained at {backup}", flush=True)
+    else:
+        # Cleanup is irreversible: never roll back to a partially removed backup.
+        try:
+            shutil.rmtree(backup)
+            info_backup.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"{split} LZ4 commit succeeded, but H.264 backup cleanup failed; "
+                f"installed LZ4 remains valid. Inspect {backup} and {info_backup}"
+            ) from exc
+        print(f"[{split}] COMMITTED LZ4 canonical; temporary H.264 backup removed", flush=True)
 
 
 def main() -> int:
@@ -516,7 +550,7 @@ def main() -> int:
     print(f"Episode jobs: {args.jobs}", flush=True)
     print("All requested splits verified; beginning canonical commit", flush=True)
     for item in prepared:
-        commit_split(item, args.chunk_frames)
+        commit_split(item, args.chunk_frames, keep_h264_backup=args.keep_h264_backup)
     total_frames = sum(int(item["frames"]) for item in prepared)
     total_bytes = sum(int(item["bytes"]) for item in prepared)
     print(

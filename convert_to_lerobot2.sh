@@ -17,6 +17,7 @@ usage() {
     cat <<'EOF'
 Usage:
   convert_to_lerobot2.sh [--color-only] [--include-surface-normals] \
+      [--keep-h264-backup] \
       [--surface-normals-encoding-version {1,2}] \
       [--preflight-only] \
       [--end-effector TYPE] \
@@ -34,8 +35,9 @@ The aligned depth view is converted to byte-exact libx264rgb/gbrp H.264 so its
 decoded bytes match the live model input. Set INCLUDE_SURFACE_NORMALS=1 to
 additionally derive a camera-frame XYZ surface-normal view directly from each
 aligned uint16 depth_0 PNG. Surface normals are stored as lossless, independent
-32-frame LZ4 chunks, with their byte-exact H.264 files retained beside them as
-an _h264_backup. Every raw_depth_0 PNG is preserved as before; surface-normal
+32-frame LZ4 chunks. Their temporary H.264 files are removed after a successful
+verified LZ4 commit unless --keep-h264-backup is selected. Every raw_depth_0 PNG
+is preserved as before; surface-normal
 conversions also preserve depth_0 losslessly for reproducibility.
 
 Arguments:
@@ -50,6 +52,8 @@ Options:
                       never padded to the 28D Dex3 layout.
   --include-surface-normals
                       Add surface_normals_view and its lossless LZ4 sidecar.
+  --keep-h264-backup   Retain the original surface-normal MP4s and metadata
+                      after installing LZ4 (default: remove after commit).
   --surface-normals-encoding-version {1,2}
                       Surface-normal pixel contract. Default: 2 (depth-range
                       masked). Use 1 only to reproduce a legacy v1 dataset.
@@ -91,6 +95,7 @@ die() {
 
 INCLUDE_SURFACE_NORMALS="${INCLUDE_SURFACE_NORMALS:-0}"
 SURFACE_NORMALS_ENCODING_VERSION="${SURFACE_NORMALS_ENCODING_VERSION:-2}"
+KEEP_H264_BACKUP=0
 COLOR_ONLY=0
 END_EFFECTOR="dex3"
 CAMERA_CALIBRATION_PROFILE="${CAMERA_CALIBRATION_PROFILE:-legacy-untagged}"
@@ -101,6 +106,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --include-surface-normals)
             INCLUDE_SURFACE_NORMALS=1
+            shift
+            ;;
+        --keep-h264-backup)
+            KEEP_H264_BACKUP=1
             shift
             ;;
         --surface-normals-encoding-version)
@@ -390,6 +399,9 @@ if [[ ${#SPLIT_DIRS[@]} -gt 0 ]]; then
         if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
             recursive_args+=(--include-surface-normals)
         fi
+        if [[ "$KEEP_H264_BACKUP" == 1 ]]; then
+            recursive_args+=(--keep-h264-backup)
+        fi
         bash "$SCRIPT_PATH" \
             "${recursive_args[@]}" \
             "$split_dir" \
@@ -638,7 +650,12 @@ printf 'End effector:%s (%dD state/action, %d DoF per hand)\n' \
     "$EXPECTED_HAND_DOF"
 if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf 'Geometry:    linear depth + camera-frame XYZ surface normals\n'
-    printf 'Normals:     lossless 32-frame LZ4 chunks + H.264 backup\n'
+    printf 'Normals:     lossless 32-frame LZ4 chunks\n'
+    if [[ "$KEEP_H264_BACKUP" == 1 ]]; then
+        printf 'Normals MP4: retain H.264 backup (explicit opt-in)\n'
+    else
+        printf 'Normals MP4: remove temporary H.264 backup after verified LZ4 commit\n'
+    fi
 elif [[ "$COLOR_ONLY" == 1 ]]; then
     printf 'Visual input: color_0 only (explicit one-off mode; no depth)\n'
 fi
@@ -740,10 +757,15 @@ PY
 
 if [[ "$INCLUDE_SURFACE_NORMALS" == 1 ]]; then
     printf '[3b/6] Converting surface normals to verified 32-frame LZ4 chunks...\n'
+    LZ4_ARGS=()
+    if [[ "$KEEP_H264_BACKUP" == 1 ]]; then
+        LZ4_ARGS+=(--keep-h264-backup)
+    fi
     "$UNITREE_PYTHON" -u "$LZ4_SCRIPT" \
         --split-root "$V2_DATASET" \
         --chunk-frames 32 \
-        --jobs "$JOBS"
+        --jobs "$JOBS" \
+        "${LZ4_ARGS[@]}"
 fi
 
 if [[ "$COLOR_ONLY" == 1 ]]; then
@@ -1000,7 +1022,8 @@ printf '[6/6] Validating metadata, episode count, selected media and video codec
     "$EXPECTED_RAW_TYPE" \
     "$EXPECTED_RAW_PROTOCOL" \
     "$CAMERA_CALIBRATION_PROFILE" \
-    "$SURFACE_NORMALS_ENCODING_VERSION" <<'PY'
+    "$SURFACE_NORMALS_ENCODING_VERSION" \
+    "$KEEP_H264_BACKUP" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -1025,6 +1048,7 @@ expected_raw_type = sys.argv[10]
 expected_raw_protocol = sys.argv[11] or None
 camera_calibration_profile = sys.argv[12]
 expected_surface_normals_encoding_version = int(sys.argv[13])
+keep_h264_backup = bool(int(sys.argv[14]))
 
 with (dataset / "meta" / "info.json").open(encoding="utf-8") as file:
     info = json.load(file)
@@ -1186,11 +1210,15 @@ if include_surface_normals:
     assert lz4["chunk_frames"] == 32
     assert lz4["lossless_round_trip_verified"] is True
     normal_root = dataset / lz4["root"]
-    normal_backup = dataset / lz4["h264_backup"]
     assert normal_root.is_dir(), normal_root
-    assert normal_backup.is_dir(), normal_backup
-    backup_videos = list(normal_backup.glob("episode_*.mp4"))
-    assert len(backup_videos) == expected_episodes, len(backup_videos)
+    if keep_h264_backup:
+        normal_backup = dataset / lz4["h264_backup"]
+        assert normal_backup.is_dir(), normal_backup
+        backup_videos = list(normal_backup.glob("episode_*.mp4"))
+        assert len(backup_videos) == expected_episodes, len(backup_videos)
+    else:
+        assert "h264_backup" not in lz4, lz4
+        assert not normal_root.with_name(normal_root.name + "_h264_backup").exists()
     for episode in episodes:
         episode_index = int(episode["episode_index"])
         index_path = normal_root / f"episode_{episode_index:06d}" / "index.json"

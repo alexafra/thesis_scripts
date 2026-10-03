@@ -43,7 +43,7 @@ def test_multi_late_fusion_names_encode_the_frozen_four_adapter_contract() -> No
     for experiment in LATE_EXPERIMENTS:
         assert experiment in model_dirs
     assert model_dirs.count("4x_linear_rgb50_geo50_patch_frozen") == 5
-    assert patch_flags.count('"--no-tune-vision-patch-embed"') == 5
+    assert patch_flags.count('"--no-tune-vision-patch-embed"') == 8
     assert "--no-tune-llm" in source
     assert "--no-tune-visual" in source
     assert "--tune-projector" in source
@@ -67,6 +67,19 @@ def test_late_fusion_requires_the_geometry_feature_used_by_each_pair() -> None:
     assert "rgbd_late_fusion_post_adapter" in depth_guard
     assert "normals_late_fusion_pre_adapter" in normals_guard
     assert "normals_late_fusion_post_adapter" in normals_guard
+
+
+def test_multi_separate_view_geometry_recipes_are_opt_in_and_resumable() -> None:
+    multi_source = MULTI.read_text(encoding="utf-8")
+    partial_source = PARTIAL.read_text(encoding="utf-8")
+
+    for experiment in ("rgbd_turbo_separate_views", "normals_separate_views"):
+        assert f"{experiment}) index=" in multi_source
+        assert experiment in partial_source
+    assert "g1_inspire_head_3_channel_turbo_depth_config.py" in multi_source
+    assert "_head_3_channel_surface_normals_config.py" in multi_source
+    assert "c_rgbd_turbo_separate_views_patch_frozen" in multi_source
+    assert "c_rgb_surface_normals_separate_views_patch_frozen" in multi_source
 
 
 def test_partial_uses_the_same_late_fusion_model_names_without_training() -> None:

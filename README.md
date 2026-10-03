@@ -1,5 +1,222 @@
 # Thesis scripts
 
+## Training evaluation probe: five episodes per goal
+
+The checkpoint evaluator now defaults to `--train-probe-episodes-per-goal 5`.
+It samples without replacement with seed 42, uses all available episodes when
+a goal has fewer than five, and deduplicates multi-goal episodes. The current
+Inspire training view yields 70 episodes / 21,603 frames across 14 goals.
+Training data and full held-out validation are unchanged. Existing runner
+arguments such as `--train-probe-episodes 3` are only a soft total minimum;
+they inherit the new five-per-goal default. Use the per-goal flag with `1`
+for legacy behavior, explicit `--train-traj-ids` for fixed IDs, or
+`--train-probe-episodes 0` to evaluate the entire training split.
+
+To redo only the training diagnostic, use `--train-probe-only` with
+`--train-dataset-path` and a new explicit `--output-dir`, such as
+`MODEL/training_probe_5_per_goal_exec_hor_8`. This does not rerun validation
+or select a checkpoint. Keep original validation/test outputs and selection
+provenance intact. Long training/evaluation jobs must run as independent
+system services, not Codex-managed command sessions; do not run probe
+evaluation alongside a training or live-policy GPU job.
+
+## Default RGB/geometry modality dropout
+
+The multi-runner now defaults to `MODALITY_DROPOUT=1`: **5% RGB dropout and 5%
+geometry dropout overall**, with mutually exclusive masks: 90% retain both
+views and neither case drops both. No extra flag is needed. Only selected
+geometry experiments receive these flags; RGB-only training and its output
+name remain unchanged. Set `MODALITY_DROPOUT=0` explicitly to use the original
+no-modality-dropout pipeline.
+
+The option covers RGB + grayscale depth, RGB + turbo depth, and RGB + surface
+normals: early channel fusion, pre/post-adapter late fusion, and separate image
+views. The separate grayscale recipe is selected with
+`EXPERIMENTS=rgbd_gray_separate_views`; existing experiment names are unchanged.
+
+The default state policy is `MODALITY_DROPOUT_STATE_POLICY=independent`: the
+existing state-input and state-feature masks remain independent of modality
+dropout. At the current 20% probability per state stage, measured state is
+absent in approximately 36% of examples. With 10% total visual dropout,
+approximately `0.36 * 0.10 = 3.6%` of examples lose state information and one
+visual modality together, but never both visual modalities. The existing
+state-dropout probabilities and mechanisms are not changed.
+
+The optional `MODALITY_DROPOUT_STATE_POLICY=state_first` samples the existing
+two state masks first. Vision can drop only when **both** state
+stages retain the measured state. At the current 20% probability per state
+stage, measured state is still absent in approximately 36% of examples, and
+each visual modality is still dropped in 5% of **all** examples—not 5% of the
+eligible subset. The conditional probabilities are `0.05 / 0.64 = 7.8125%`
+each among the 64% retaining state. This preserves the state-dropout marginal
+rates, rather than disabling state dropout on a separately selected visual
+subset.
+The total global visual-drop rate must not exceed `(1 - state_dropout_prob)^2`
+with `state_first`.
+
+Training with the default gets a `_moddrop05each_independent` (or
+`_moddrop05each_state_first`) output/status suffix. It does not reuse or
+overwrite old no-dropout output directories. Internal network dropout,
+arm/hand normalization, action labels, and dataset conversion stay unchanged.
+Masks apply consistently across all frames of a sample and every visual
+feature/fusion path. There is no rescaling of the surviving modality. Modality
+dropout is disabled during evaluation/deployment, where both inputs remain.
+This augmentation does not automatically include the dark recordings in
+training, and missing a modality is not equivalent to realistic low lighting.
+
+Example readiness check **without training** (first-time virtual-dataset
+creation, if requested separately, still writes its indexed view):
+
+```bash
+DATASET_ROOT=/path/to/normal_condition_dataset \
+EXPERIMENTS=rgb,normals_late_fusion_pre_adapter,rgbd_gray_separate_views \
+PRECHECK_ONLY=1 \
+  /home/alex/Development/scripts/multi_finetune_evaluation.sh
+```
+
+The generic `examples/finetune.sh` wrapper and Python launcher expose
+`--vision-modality-dropout-rgb-prob`,
+`--vision-modality-dropout-geometry-prob`, and
+`--vision-modality-dropout-state-policy`. Probabilities default to zero and
+are saved in the checkpoint config together with the ordered source keys.
+These low-level Python/model defaults remain zero for checkpoint compatibility;
+the regular multi-runner automatically supplies 0.05/0.05 for geometry runs.
+Active dropout rejects RGB-only or ambiguous view/channel layouts.
+
+To re-run evaluation later, use the same state policy,
+`RUN_SUFFIX`, and named `EXPERIMENTS` with
+`partial_multi_finetune_evaluation.sh`. Named recipes there also default to
+the new dropout-suffixed directories; set `MODALITY_DROPOUT=0` to evaluate
+older no-dropout models. In that evaluator these switches only
+select the matching training output directories; they do **not** enable
+dropout during evaluation. RGB paths stay unchanged. The fixed historical
+`missed_normals` selection supports only `MODALITY_DROPOUT=0`; choose `normals`
+or another named geometry recipe for newer runs. Grayscale separate views are
+available there as `rgbd_gray_separate_views` too.
+
+## Separate converted datasets, one training/evaluation view
+
+New LeRobot v2.1 components can stay in their own folders. The opt-in indexed
+view gives the existing trainer and evaluator one ordinary logical dataset,
+without copying/re-encoding RGB, depth, or normal media. It writes small numeric
+Parquet indexes and metadata, and references the original media with symlinks.
+**Keep the source folders in place and immutable while a view is in use.**
+
+Create the view only (does not start training):
+
+```bash
+cd /home/alex/Development/Isaac-GR00T
+.venv/bin/python -m gr00t.data.virtual_dataset \
+  --sources /path/to/existing_split_root /path/to/new_split_root \
+  --output /path/to/combined_view
+```
+
+Each source above contains `train/`, `validation/`, and `test/`. Existing split
+membership is retained: train joins train, validation joins validation, and test
+joins test. The standalone command also accepts direct dataset roots to form
+one direct view; never include held-out data in training unless deliberately
+changing that experiment. Source order fixes global episode order. Identical
+goal text shares one task ID per split; it does **not** deduplicate episodes.
+Do not supply both an older dataset and an appended superset of it.
+
+The existing multi-runner and partial evaluation runner can build/reuse the view
+automatically. For example, a preparation/readiness check without training:
+
+```bash
+DATASET_SOURCES=/path/to/existing_split_root:/path/to/new_split_root \
+VIRTUAL_DATASET_ROOT=/path/to/combined_view \
+PRECHECK_ONLY=1 \
+  /home/alex/Development/scripts/multi_finetune_evaluation.sh
+```
+
+The first invocation writes the view even with `PRECHECK_ONLY=1`; subsequent
+invocations reuse it only when its source signature matches. Remove
+`PRECHECK_ONLY=1` only when ready to run training. Use the same two variables
+with `partial_multi_finetune_evaluation.sh` to evaluate existing checkpoints;
+that runner does not train. Do not combine these variables with `DATASET_ROOT`
+or explicit split overrides. The shell form uses `:` as the separator; the
+standalone command supports paths containing colons.
+The runner prepares only train/validation splits by default; `EVALUATION_SPLIT=none`
+prepares train alone. Test is neither required nor recreated. The standalone builder
+also accepts `--splits train validation`; omitting `--splits` retains its legacy discovery.
+
+Normalization is recomputed over the combined **training** population, using
+the unchanged GR00T code, not averages of component percentiles. The existing
+relative-arm/absolute-hand configuration and clipping remain unchanged;
+relative-arm statistics are generated for the selected action horizon by the
+normal launcher. Evaluation uses checkpoint-saved training normalization, not
+validation normalization. A single view also preserves the current sharding,
+episode boundaries, and evaluation aggregation instead of introducing mixture
+weights. Equivalence means the same ordered examples and preprocessing as a
+freshly normalized physical append of these same components, with the same
+split membership, configuration, seed, and worker settings—not identical
+results to a smaller old dataset, nor a guarantee of bit-identical GPU training.
+
+Compatibility checks reject mismatched layouts, encoding/range/calibration
+contracts and repeated source roots. Available episode provenance hashes are
+also checked across all selected splits to catch duplicate recordings and split leakage.
+Without provenance, disjoint recording membership remains the caller's
+responsibility; shared goals are fine. New components require a new view output path rather
+than overwriting a view used by a running job. Existing source statistics are
+not edited or inherited. Old physical-append commands and ordinary
+`DATASET_ROOT=/path/to/merged_dataset` usage remain unchanged as the fallback.
+
+## Final train + validation fit, evaluation deferred
+
+`final_train_inspire.sh` is an opt-in final-training wrapper. It first builds the
+combined train/validation view (including cross-split provenance checks),
+then creates a fresh training view containing **all train followed by all validation
+episodes**. Its normalization is fitted to that full training population. It neither
+requires nor builds a test view, and it does not run evaluation after training.
+Validation is now training data, so evaluating on it would not be held-out validation.
+No media is copied or re-encoded, and all source folders must remain available.
+
+Prepare the views without starting training or evaluation:
+
+```bash
+FINAL_DATASET_SOURCES=/path/to/existing_split_root:/path/to/new_split_root \
+FINAL_VIEW_ROOT=/path/to/new_final_view \
+  bash /home/alex/Development/scripts/final_train_inspire.sh prepare
+```
+
+Then choose the training budget explicitly. `check` runs the existing readiness
+checks; replace it with `run` to train RGB followed by turbo-depth pre-adapter late
+fusion without running evaluation:
+
+```bash
+FINAL_DATASET_SOURCES=/path/to/existing_split_root:/path/to/new_split_root \
+FINAL_VIEW_ROOT=/path/to/new_final_view \
+MAX_STEPS=35000 \
+  bash /home/alex/Development/scripts/final_train_inspire.sh check
+```
+
+The wrapper defaults to `EXPERIMENTS=rgb,rgbd_turbo_late_fusion_pre_adapter`.
+Geometry modality dropout retains the standard default; RGB remains unchanged.
+`MAX_STEPS` must be explicitly chosen for `check`/`run`, and divisible by
+`SAVE_STEPS` (default 5000). In the general multi-runner, `MAX_STEPS` defaults to
+25000 and `RUN_LABEL` is derived automatically (for example `30k` or `35k`).
+
+The wrapper enforces `EVALUATION_SPLIT=none` and records evaluation as skipped in
+the existing status table. Ordinary validation runs require train and validation
+datasets only; a test dataset is not a readiness prerequisite.
+
+Test evaluation remains deferred. A separate, deliberate general multi-runner
+invocation must set both `EVALUATION_SPLIT=test` and `ALLOW_TEST_EVALUATION=1` before
+it can touch a test dataset. That mode selects **only the predetermined final
+checkpoint**, not the best checkpoint on test. Results go to
+`test_evaluation_exec_hor_8` and `test_normalized_action_metrics_exec_hor_8`.
+The existing evaluator still labels its held-out CSV/plot series `validation`
+internally; in these specifically named test output folders, that series is the
+test set, not the old validation episodes. `evaluation_protocol.json` at the model
+root records the true split, training/test paths, fixed checkpoint, and the
+prohibition on selecting checkpoints using test. Do not use test results to retune or select checkpoints and
+then claim the same data as an untouched final test.
+
+Ordinary `multi_finetune_evaluation.sh` usage retains `EVALUATION_SPLIT=validation`,
+its original output directory names, and all-checkpoint validation comparison.
+Its training probe uses five episodes per goal.
+The physical-merge pipeline remains available and unchanged.
+
 ## General Inspire dataset pipeline
 
 `prepare_inspire_lerobot2.sh` is the reusable coordinator for either one complete,
@@ -232,6 +449,12 @@ embedding frozen, and train the four 50/50-initialized linear fusion adapters.
 They are never included by the default `rgb,normals,depth` selection. The same
 names can be passed to `partial_multi_finetune_evaluation.sh` to evaluate a
 completed late-fusion training run without another dedicated runner.
+
+Two additional opt-in frozen-patch, ordinary separate-view recipes are
+`rgbd_turbo_separate_views` and `normals_separate_views`. The former applies
+the pinned fixed-Turbo lookup to `depth_gray_view` in memory; neither recipe
+uses early-channel or late-adapter fusion. Both names are also accepted by the
+partial evaluator.
 
 Passing the original `--source` to either command additionally rechecks exact
 raw-to-split provenance. `all` is the only mode that performs conversion and
